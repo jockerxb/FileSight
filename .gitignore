@@ -1,0 +1,6 @@
+.build/
+dist/
+.DS_Store
+/VERIFICATION.md
+/assets/branding/logo-concept-v1.md
+/assets/branding/qianliyan-logo-concept-v1.png
