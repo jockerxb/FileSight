@@ -8,7 +8,8 @@ let port = UInt16(args[2])!
 let fixture = folder + "/document.txt"
 var checks: [String: Bool] = [:]
 let readable = open(fixture, O_RDONLY)
-checks["readAllowed"] = readable >= 0
+let expectRead = !args.contains("deny-read")
+checks["readPolicyPassed"] = expectRead ? readable >= 0 : readable < 0 && (errno == EPERM || errno == EACCES)
 if readable >= 0 { close(readable) }
 let write = open(fixture, O_WRONLY | O_TRUNC)
 checks["overwriteDenied"] = write < 0 && errno == EPERM
@@ -39,7 +40,7 @@ else {
 if args.count > 3 && args[3] == "parent" {
     let child = Process()
     child.executableURL = URL(fileURLWithPath: args[0]).deletingLastPathComponent().appendingPathComponent("ChildProbe")
-    child.arguments = [folder, args[2]]
+    child.arguments = [folder, args[2]] + (expectRead ? [] : ["deny-read"])
     let output = Pipe(); child.standardOutput = output
     try child.run()
     let data = output.fileHandleForReading.readDataToEndOfFile()

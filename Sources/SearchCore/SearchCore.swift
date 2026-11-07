@@ -80,15 +80,26 @@ final class ScanToken {
 }
 
 public final class FileIndex {
+    private struct Record {
+        let pages: [SearchPage]
+        let count: Int
+        let children: [String: DirectoryIdentity]
+        let childPaths: Set<String>
+        let errors: [String]
+    }
     private let lock = NSLock()
-    private var chunks: [SearchPage] = []
-    private var tail: [FileEntry] = []
-    private var tailFingerprints: [NameFingerprint] = []
+    private var records: [String: Record] = [:]
+    private var cachedPages: [SearchPage] = []
+    private var pagesDirty = false
     private var count = 0
+    private var errorCount = 0
     private var revision = 0
     private var scanning = false
-    private var errors: [String] = []
-    private var errorCount = 0
+    private var watchFailed = false
+    private var roots: [ScanRoot] = []
+    private var dirty: Set<String> = []
+    private var needsRebuild = false
+    private var watcher: FolderEvents?
     private var token = ScanToken()
     private let workerURL: URL
     private let timeout: TimeInterval
@@ -99,67 +110,166 @@ public final class FileIndex {
     }
 
     public func snapshot() -> ScanSnapshot {
-        lock.lock(); defer { lock.unlock() }
-        return ScanSnapshot(entries: chunks.flatMap(\.entries) + tail, revision: revision, scanning: scanning, errorCount: errorCount, errors: errors)
+        let current = view()
+        return ScanSnapshot(entries: current.pages.flatMap(\.entries), revision: current.revision, scanning: current.scanning,
+                            errorCount: current.errorCount, errors: current.errors)
     }
 
-    // Immutable pages prevent every scanner update from copying a million-row
-    // array while the UI holds a snapshot. Only the small tail can be copied.
     public func view() -> IndexView {
         lock.lock(); defer { lock.unlock() }
-        var pages = chunks
-        if !tail.isEmpty { pages.append(SearchPage(entries: tail, fingerprints: tailFingerprints)) }
-        return IndexView(pages: pages, revision: revision, count: count, scanning: scanning, errorCount: errorCount, errors: errors)
+        if pagesDirty {
+            cachedPages = records.values.flatMap(\.pages)
+            pagesDirty = false
+        }
+        var errors = watchFailed ? ["无法监听目录变化；可手动刷新索引。"] : []
+        if errorCount > 0 {
+            for record in records.values where !record.errors.isEmpty {
+                errors.append(contentsOf: record.errors.prefix(200 - errors.count))
+                if errors.count == 200 { break }
+            }
+        }
+        return IndexView(pages: cachedPages, revision: revision, count: count, scanning: scanning,
+                         errorCount: errorCount + (watchFailed ? 1 : 0), errors: errors)
     }
 
-    public func start(roots: [URL]) {
+    // Entry point for unsandboxed scanner verification. The App uses the
+    // authorized overload, carrying only grants explicitly picked by the user.
+    public func start(roots: [URL], watch: Bool = false) {
+        start(authorizedRoots: Self.uniqueRoots(roots).map { ScanRoot(url: $0) }, watch: watch)
+    }
+
+    public func start(authorizedRoots: [ScanRoot], watch: Bool = true) {
+        var selected: [ScanRoot] = []
+        for root in authorizedRoots.sorted(by: { $0.path.count < $1.path.count }) {
+            if !selected.contains(where: { $0.contains(root.path) }) { selected.append(root) }
+        }
         lock.lock()
         token.cancel()
         let current = ScanToken()
         token = current
-        chunks = []; tail = []; tailFingerprints = []; count = 0; errors = []; errorCount = 0; scanning = true; revision += 1
+        let previousWatcher = watcher
+        watcher = nil
+        roots = selected
+        records = [:]; cachedPages = []; pagesDirty = false; count = 0; errorCount = 0
+        dirty = []; needsRebuild = false; watchFailed = false
+        scanning = !selected.isEmpty; revision += 1
         lock.unlock()
-        DispatchQueue.global(qos: .utility).async { [self] in
-            let roots = Self.uniqueRoots(roots)
-            let jobs = DirectoryJobs(roots: roots)
-            let excludes = roots.contains(where: { $0.path == "/" }) ? ["/dev", "/System/Volumes"] : []
-            let group = DispatchGroup()
-            func receive(_ response: ScanResponse) {
-                lock.lock(); defer { lock.unlock() }
-                guard !current.cancelled else { return }
-                count += response.entries.count
-                for entry in response.entries {
-                    tail.append(entry)
-                    tailFingerprints.append(NameFingerprint(normalized: entry.searchableName))
-                    if tail.count == 1024 { chunks.append(SearchPage(entries: tail, fingerprints: tailFingerprints)); tail = []; tailFingerprints = [] }
-                }
-                errorCount += response.errors.count
-                errors.append(contentsOf: response.errors.prefix(max(0, 200 - errors.count)))
-                revision += 1
+        withExtendedLifetime(previousWatcher) {}
+        guard !selected.isEmpty else { return }
+
+        // Start monitoring before scanning so changes during the initial pass
+        // are queued and applied after it finishes.
+        if watch {
+            let events = FolderEvents { [weak self, current] paths, uncertain in
+                self?.invalidate(paths: paths, uncertain: uncertain, token: current)
             }
-            for _ in 0..<4 {
-                group.enter()
-                DispatchQueue.global(qos: .utility).async {
-                    let session = ScanWorkerSession(executable: self.workerURL, timeout: self.timeout, token: current)
-                    defer { session.stop(); group.leave() }
-                    while let job = jobs.next(token: current) {
-                        var children: [String] = []
-                        do {
-                            try session.scan(ScanRequest(path: job.path, includeRoot: job.includeRoot, excludes: excludes)) { response in
-                                children.append(contentsOf: response.directories)
-                                receive(response)
-                            }
-                        } catch {
-                            receive(ScanResponse(errors: ["\(job.path)：\(error.localizedDescription)"]))
-                        }
-                        jobs.complete(children: children)
-                    }
-                }
+            let started = events.start(paths: selected.map(\.path))
+            lock.lock()
+            if !current.cancelled {
+                if started { watcher = events } else { watchFailed = true; revision += 1 }
             }
-            group.wait()
-            lock.lock(); defer { lock.unlock() }
-            if !current.cancelled { scanning = false; revision += 1 }
+            lock.unlock()
         }
+        schedule(selected.map { DirectoryJob(path: $0.path, root: $0, recursive: true) }, token: current, parallelism: 4)
+    }
+
+    private func invalidate(paths: [String], uncertain: Bool, token current: ScanToken) {
+        lock.lock()
+        guard !current.cancelled else { lock.unlock(); return }
+        if uncertain { needsRebuild = true }
+        for path in paths {
+            if let root = roots.first(where: { $0.contains(path) }) {
+                // File events refer to either a file or a directory. Refresh
+                // its parent listing; new directory identities trigger a walk.
+                dirty.insert(path == root.path ? path : (path as NSString).deletingLastPathComponent)
+            }
+        }
+        if dirty.count > 4096 { dirty = []; needsRebuild = true }
+        let jobs = scanning ? [] : takePending()
+        lock.unlock()
+        if !jobs.isEmpty { schedule(jobs, token: current, parallelism: 1) }
+    }
+
+    // Called with lock held.
+    private func takePending() -> [DirectoryJob] {
+        let jobs: [DirectoryJob]
+        if needsRebuild {
+            jobs = roots.map { DirectoryJob(path: $0.path, root: $0, recursive: true) }
+        } else {
+            jobs = dirty.sorted { $0.count < $1.count }.compactMap { path in
+                roots.first(where: { $0.contains(path) }).map { DirectoryJob(path: path, root: $0, recursive: false) }
+            }
+        }
+        dirty = []; needsRebuild = false
+        if !jobs.isEmpty { scanning = true; revision += 1 }
+        return jobs
+    }
+
+    private func schedule(_ initial: [DirectoryJob], token current: ScanToken, parallelism: Int) {
+        let jobs = DirectoryJobs(initial)
+        let group = DispatchGroup()
+        for _ in 0..<parallelism {
+            group.enter()
+            DispatchQueue.global(qos: .utility).async { [self] in
+                let session = ScanWorkerSession(executable: workerURL, timeout: timeout, token: current)
+                defer { session.stop(); group.leave() }
+                while let job = jobs.next(token: current) {
+                    var entries: [FileEntry] = []
+                    var children: Set<String> = []
+                    var identities: [String: DirectoryIdentity] = [:]
+                    var errors: [String] = []
+                    var failed = false
+                    do {
+                        try session.scan(ScanRequest(path: job.path, root: job.root)) { response in
+                            entries.append(contentsOf: response.entries)
+                            children.formUnion(response.directories)
+                            identities.merge(response.identities ?? [:]) { _, new in new }
+                            errors.append(contentsOf: response.errors)
+                            failed = response.failed == true
+                        }
+                    } catch {
+                        errors.append("\(job.path)：\(error.localizedDescription)")
+                        failed = true
+                    }
+                    if failed { entries = []; children = []; identities = [:] }
+                    let next = commit(job: job, entries: entries, children: children, identities: identities, errors: errors, token: current)
+                    jobs.complete(children: next)
+                }
+            }
+        }
+        group.notify(queue: .global(qos: .utility)) { [self] in
+            lock.lock()
+            guard !current.cancelled else { lock.unlock(); return }
+            scanning = false; revision += 1
+            let pending = takePending()
+            lock.unlock()
+            if !pending.isEmpty { schedule(pending, token: current, parallelism: 1) }
+        }
+    }
+
+    private func commit(job: DirectoryJob, entries: [FileEntry], children: Set<String>, identities: [String: DirectoryIdentity],
+                        errors: [String], token current: ScanToken) -> [DirectoryJob] {
+        let pages = stride(from: 0, to: entries.count, by: 1024).map { start in
+            SearchPage(entries: Array(entries[start..<min(start + 1024, entries.count)]))
+        }
+        lock.lock(); defer { lock.unlock() }
+        guard !current.cancelled else { return [] }
+        let old = records[job.path]
+        func remove(_ path: String) {
+            if let previous = records.removeValue(forKey: path) {
+                count -= previous.count; errorCount -= previous.errors.count
+            }
+        }
+        let outdated = old?.childPaths.filter { !children.contains($0) || old?.children[$0] != identities[$0] } ?? []
+        if !outdated.isEmpty {
+            let prefixes = outdated.map { $0 + "/" }
+            for path in Array(records.keys) where outdated.contains(path) || prefixes.contains(where: { path.hasPrefix($0) }) { remove(path) }
+        }
+        remove(job.path)
+        records[job.path] = Record(pages: pages, count: entries.count, children: identities, childPaths: children, errors: errors)
+        count += entries.count; errorCount += errors.count; revision += 1; pagesDirty = true
+        return children.sorted().filter { job.recursive || old?.childPaths.contains($0) != true || old?.children[$0] != identities[$0] }
+            .map { DirectoryJob(path: $0, root: job.root, recursive: true) }
     }
 
     public static func uniqueRoots(_ roots: [URL]) -> [URL] {

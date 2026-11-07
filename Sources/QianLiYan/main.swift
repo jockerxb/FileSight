@@ -10,6 +10,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     let logo = NSImageView(image: Branding.mark())
     let direction = NSButton()
     let status = NSTextField(labelWithString: "")
+    let authorize = NSButton()
     let summary = NSTextField(labelWithString: "")
     let countRow = NSStackView()
     let table = NSTableView()
@@ -20,27 +21,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     var statusItem: NSStatusItem!
     var activeShortcut: LauncherShortcut?
     var editingShortcut = false
+    var settings: SettingsWindow?
     enum Scope: Int, CaseIterable {
-        case downloads, home, disks, custom
-        var title: String {
-            switch self {
-            case .downloads: "下载"
-            case .home: "个人目录"
-            case .disks: "本机本地磁盘"
-            case .custom: "选择目录…"
-            }
-        }
-        var roots: [URL] {
-            switch self {
-            case .downloads: [LocalFiles.userHome.appendingPathComponent("Downloads", isDirectory: true)]
-            case .home: [LocalFiles.userHome]
-            case .disks: [URL(fileURLWithPath: "/", isDirectory: true)]
-            case .custom: []
-            }
-        }
+        case downloads, custom
+        var title: String { self == .downloads ? "下载" : "选择目录…" }
     }
+    let downloads = LocalFiles.userHome.appendingPathComponent("Downloads", isDirectory: true)
     var selectedScope: Scope = .downloads
-    var roots = Scope.downloads.roots
+    var roots: [ScanRoot] = []
     var rows: [FileEntry] = []
     var totalMatches = 0
     var order = SearchOrder.relevance
@@ -59,6 +47,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     let formatter: DateFormatter = {
         let f = DateFormatter(); f.locale = Locale(identifier: "zh_CN"); f.dateFormat = "yyyy/MM/dd HH:mm"; return f
     }()
+    var productTitle: String { "千里眼 \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "2.1")" }
     static let orderTitles = ["名称优先", "修改时间", "创建时间", "文件类型", "文件名"]
     var theme = LauncherTheme(rawValue: UserDefaults.standard.integer(forKey: LauncherTheme.preferenceKey)) ?? .dark
 
@@ -75,7 +64,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             .flatMap { try? JSONDecoder().decode(LauncherShortcut.self, from: $0) }
         let preferred = saved.flatMap { $0.isValid ? $0 : nil } ?? .defaultShortcut
         if hotkey.register(preferred) { activeShortcut = preferred }
-        showPanel()
+        if !LoginLaunch.isLoginEvent { showPanel() }
         rescan()
         timer = Timer.scheduledTimer(withTimeInterval: 0.65, repeats: true) { [weak self] _ in self?.pollIndex() }
     }
@@ -83,12 +72,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     func buildApplicationMenu() {
         let main = NSMenu()
         let root = NSMenuItem(); root.submenu = NSMenu(); main.addItem(root)
+        root.submenu?.addItem(withTitle: "设置…", action: #selector(showSettings), keyEquivalent: ",").target = self
         root.submenu?.addItem(withTitle: "退出千里眼", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         let editItem = NSMenuItem(); let edit = NSMenu(title: "编辑"); editItem.submenu = edit; main.addItem(editItem)
         for (title, action, key) in [("剪切", #selector(NSText.cut(_:)), "x"), ("复制", #selector(NSText.copy(_:)), "c"), ("粘贴", #selector(NSText.paste(_:)), "v"), ("全选", #selector(NSText.selectAll(_:)), "a")] { edit.addItem(withTitle: title, action: action, keyEquivalent: key) }
         let searchItem = NSMenuItem(); let menu = NSMenu(title: "搜索"); searchItem.submenu = menu; main.addItem(searchItem)
         menu.addItem(withTitle: "呼出搜索", action: #selector(showPanel), keyEquivalent: "f").target = self
-        menu.addItem(withTitle: "重新扫描", action: #selector(rescan), keyEquivalent: "r").target = self
+        menu.addItem(withTitle: "刷新索引", action: #selector(rescan), keyEquivalent: "r").target = self
         let copy = menu.addItem(withTitle: "复制完整路径", action: #selector(copyPath), keyEquivalent: "c"); copy.keyEquivalentModifierMask = [.command, .shift]; copy.target = self
         NSApp.mainMenu = main
     }
@@ -140,9 +130,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         sort.onSelection = { [weak self] in self?.sortChanged() }
         configure(direction, title: "", action: #selector(toggleDirection))
         updateDirection()
+        configure(authorize, title: "授权下载…", action: #selector(authorizeDownloads))
         status.font = .systemFont(ofSize: 11); status.textColor = .secondaryLabelColor
         status.isHidden = true
-        let controls = NSStackView(views: [scope, status, NSView(), sort, direction])
+        let controls = NSStackView(views: [scope, authorize, status, NSView(), sort, direction])
         controls.spacing = 8; controls.edgeInsets = NSEdgeInsets(top: 0, left: 22, bottom: 0, right: 20)
         controls.heightAnchor.constraint(equalToConstant: 35).isActive = true
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("result")); table.addTableColumn(column)
@@ -246,7 +237,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         var frame = panel.frame
         if abs(frame.height - height) > 1 { frame.origin.y += frame.height - height; frame.size.height = height; panel.setFrame(frame, display: true, animate: false) }
     }
-    func searchKey(_ view: IndexView) -> String { "\(scanGeneration)|\(view.count)|\(field.stringValue)|\(order.rawValue)|\(ascending)|\(limit)" }
+    func searchKey(_ view: IndexView) -> String { "\(scanGeneration)|\(view.revision)|\(field.stringValue)|\(order.rawValue)|\(ascending)|\(limit)" }
     func performSearch() {
         guard !searchBusy else { return }
         let view = index.view()
@@ -264,7 +255,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 let selection = selected.flatMap { path in self.rows.firstIndex(where: { $0.path == path }) } ?? 0
                 if !self.rows.isEmpty { self.table.selectRowIndexes(IndexSet(integer: selection), byExtendingSelection: false) }
                 self.updateSearchDisplay(message: output.rows.isEmpty
-                    ? (view.scanning ? "暂未找到匹配项" : "没有匹配项")
+                    ? (self.roots.isEmpty ? "授权目录后搜索" : view.scanning ? "暂未找到匹配项" : "没有匹配项")
                     : "\(output.total.formatted()) 项")
             }
         }
@@ -304,22 +295,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     @objc func showMore() { limit += 100; requestSearch(resetLimit: false) }
     @objc func scopeChanged() {
         guard let next = Scope(rawValue: scope.indexOfSelectedItem) else { return }
-        if next == .custom { chooseFolders(); return }
-        selectedScope = next; roots = next.roots; rescan()
+        if next == .downloads {
+            if selectedScope != .downloads || roots.isEmpty { authorizeDownloads() }
+        } else { chooseFolders() }
     }
-    @objc func chooseFolders() {
-        let dialog = NSOpenPanel(); dialog.canChooseFiles = false; dialog.canChooseDirectories = true; dialog.canCreateDirectories = false; dialog.allowsMultipleSelection = true
-        dialog.prompt = "搜索这些目录"; dialog.message = "只读本地文件名。不会上传、编辑或删除文件。"
+    @objc func authorizeDownloads() { pickFolders(for: .downloads) }
+    @objc func chooseFolders() { pickFolders(for: .custom) }
+    private func pickFolders(for requested: Scope) {
+        let dialog = NSOpenPanel()
+        dialog.canChooseFiles = false; dialog.canChooseDirectories = true
+        dialog.canCreateDirectories = false; dialog.allowsMultipleSelection = requested == .custom
+        dialog.directoryURL = downloads
+        dialog.prompt = "授权只读"
+        dialog.message = "只搜索你选中的本地目录。退出后不保留目录授权和索引。"
         if dialog.runModal() == .OK {
-            selectedScope = .custom; roots = dialog.urls; rescan()
+            do {
+                let selected = try dialog.urls.map(ScanRoot.authorized)
+                selectedScope = requested == .downloads && selected.count == 1 && selected[0].path == FileIndex.canonicalRoot(downloads).path
+                    ? .downloads : .custom
+                roots = selected
+                rescan()
+            } catch {
+                alert("无法授权目录", "请选择可读取的本地文件夹；未更改原有搜索范围。")
+            }
         }
         scope.selectItem(at: selectedScope.rawValue)
         panel.makeKeyAndOrderFront(nil); panel.makeFirstResponder(field)
     }
     @objc func rescan() {
         requestID += 1; scanGeneration += 1; token.cancel(); token = SearchCancellation(); pending?.cancel(); searchBusy = false; appliedKey = ""; shownRevision = -1
-        index.start(roots: roots)
-        scope.toolTip = roots.map(\.path).joined(separator: "；")
+        index.start(authorizedRoots: roots)
+        authorize.isHidden = !roots.isEmpty
+        scope.toolTip = roots.isEmpty ? "尚未授权目录" : roots.map(\.path).joined(separator: "；")
         rows = []; table.reloadData()
         if !field.stringValue.isEmpty { requestSearch(resetLimit: true) }
         pollIndex()
@@ -340,60 +347,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         let menu = NSMenu()
         menu.addItem(withTitle: "呼出搜索  \(activeShortcut?.label ?? "菜单栏")", action: #selector(showPanel), keyEquivalent: "").target = self
         menu.addItem(.separator())
-        menu.addItem(withTitle: "设置呼出快捷键…", action: #selector(editShortcut), keyEquivalent: "").target = self
-        let appearance = NSMenu(title: "外观")
-        for value in LauncherTheme.allCases {
-            let item = appearance.addItem(withTitle: value.title, action: #selector(changeTheme(_:)), keyEquivalent: "")
-            item.target = self; item.tag = value.rawValue; item.state = value == theme ? .on : .off
-        }
-        let appearanceRoot = NSMenuItem(title: "外观", action: nil, keyEquivalent: "")
-        appearanceRoot.submenu = appearance; menu.addItem(appearanceRoot)
-        let sorting = NSMenu(title: "默认排序")
-        for value in SearchOrder.allCases {
-            let item = sorting.addItem(withTitle: Self.orderTitles[value.rawValue], action: #selector(changeSortFromMenu(_:)), keyEquivalent: ""); item.target = self; item.tag = value.rawValue; item.state = value == order ? .on : .off
-        }
-        let sortRoot = NSMenuItem(title: "排序方式", action: nil, keyEquivalent: ""); sortRoot.submenu = sorting; menu.addItem(sortRoot)
-        menu.addItem(withTitle: "选择搜索目录…", action: #selector(chooseFolders), keyEquivalent: "").target = self
-        menu.addItem(withTitle: "重新扫描本地目录", action: #selector(rescan), keyEquivalent: "").target = self
-        menu.addItem(withTitle: "索引状态与访问详情…", action: #selector(showIssues), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "设置…", action: #selector(showSettings), keyEquivalent: ",").target = self
         menu.addItem(.separator())
-        let view = index.view()
-        let state = NSMenuItem(title: "本地只读 · 已收录 \(view.count.formatted()) 项", action: nil, keyEquivalent: ""); state.isEnabled = false; menu.addItem(state)
-        menu.addItem(withTitle: "关于千里眼 2.0", action: #selector(showAbout), keyEquivalent: "").target = self
         menu.addItem(withTitle: "退出千里眼", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.popUp(positioning: nil, at: .zero, in: button)
     }
-    @objc func changeTheme(_ sender: NSMenuItem) {
-        guard let selected = LauncherTheme(rawValue: sender.tag) else { return }
-        theme = selected
-        UserDefaults.standard.set(selected.rawValue, forKey: LauncherTheme.preferenceKey)
-        applyTheme()
-        if !panel.isVisible { showPanel() }
-    }
-    @objc func editShortcut() {
-        guard !editingShortcut else { return }
-        editingShortcut = true
-        defer { editingShortcut = false }
-        NSApp.activate(ignoringOtherApps: true)
-        guard let next = ShortcutRecorder.choose(current: activeShortcut) else { return }
-        guard activeShortcut?.matches(next) == true || hotkey.register(next) else {
-            alert("无法注册快捷键", "\(next.label) 可能已被系统或其他应用占用。当前设置保持不变，请试另一个组合。")
-            return
+    @objc func showSettings() {
+        if settings == nil {
+            let controller = SettingsWindow(productTitle: productTitle)
+            controller.onTheme = { [weak self] selected in
+                guard let self else { return }
+                self.theme = selected
+                UserDefaults.standard.set(selected.rawValue, forKey: LauncherTheme.preferenceKey)
+                self.applyTheme()
+            }
+            controller.onShortcut = { [weak self] in self?.saveShortcut($0) ?? false }
+            controller.onRecording = { [weak self] recording in
+                guard let self else { return }
+                self.editingShortcut = recording
+                if recording { self.hotkey.suspend() }
+                else if let shortcut = self.activeShortcut { self.hotkey.resume(shortcut) }
+            }
+            controller.onDiagnostics = { [weak self] in self?.showIssues() }
+            settings = controller
         }
+        panel.orderOut(nil)
+        settings?.update(theme: theme, shortcut: activeShortcut)
+        NSApp.activate(ignoringOtherApps: true)
+        settings?.showWindow(nil)
+        settings?.window?.makeKeyAndOrderFront(nil)
+    }
+    func saveShortcut(_ next: LauncherShortcut) -> Bool {
+        guard hotkey.register(next) else { return false }
         activeShortcut = next
         if let data = try? JSONEncoder().encode(next) {
             UserDefaults.standard.set(data, forKey: LauncherShortcut.preferenceKey)
         }
+        return true
     }
-    @objc func changeSortFromMenu(_ sender: NSMenuItem) { sort.selectItem(at: sender.tag); sortChanged(); if !panel.isVisible { showPanel() } }
-    @objc func showIssues() {
+    func showIssues() {
+        guard let window = settings?.window else { return }
         let view = index.view()
-        let text = NSTextView(frame: NSRect(x: 0, y: 0, width: 640, height: 350)); text.isEditable = false; text.font = .systemFont(ofSize: 12)
-        text.string = "搜索范围：\(roots.map(\.path).joined(separator: "；"))\n\n索引与搜索词仅保存在内存。不联网、不读取正文、不修改文档。搜索支持多个空格分隔的文件名关键词。\n\n名称优先：完整名称／无扩展名名称优先，其次开头匹配，最后包含匹配；同级最近修改优先。类型：按扩展名分组，同组最近修改优先。\n\n结果分批显示，每批 100 条，可以继续加载全部匹配项；无匹配数量截断。未下载的云端内部不会主动下载。\n\n访问提示 \(view.errorCount) 处，最多显示 200 处：\n" + view.errors.joined(separator: "\n")
-        let scroll = NSScrollView(frame: text.frame); scroll.documentView = text; scroll.hasVerticalScroller = true; text.isVerticallyResizable = true; text.autoresizingMask = [.width]
-        let dialog = NSAlert(); dialog.messageText = "本地索引与访问详情"; dialog.accessoryView = scroll; dialog.runModal()
+        let dialog = NSAlert()
+        dialog.messageText = "搜索诊断"
+        if roots.isEmpty {
+            dialog.informativeText = "尚未授权目录。请先从搜索面板选择目录。"
+        } else {
+            let state = view.scanning ? "正在更新" : view.errorCount > 0 ? "有访问提示" : "索引已就绪"
+            dialog.informativeText = "\(state) · 已收录 \(view.count.formatted()) 项"
+        }
+        dialog.addButton(withTitle: "完成")
+        let canRefresh = !roots.isEmpty && !view.scanning
+        if canRefresh { dialog.addButton(withTitle: "刷新索引") }
+        if !roots.isEmpty {
+            let details = NSTextView(frame: NSRect(x: 0, y: 0, width: 395, height: 125))
+            details.isEditable = false; details.font = .systemFont(ofSize: 12)
+            let issues = view.errorCount > 0 ? "\n\n访问提示（\(view.errorCount) 处）\n" + view.errors.joined(separator: "\n") : ""
+            details.string = "搜索范围\n" + roots.map(\.path).joined(separator: "\n") + issues
+            details.isVerticallyResizable = true; details.autoresizingMask = [.width]
+            let scroll = NSScrollView(frame: details.frame)
+            scroll.documentView = details; scroll.hasVerticalScroller = true
+            dialog.accessoryView = scroll
+        }
+        dialog.beginSheetModal(for: window) { [weak self] response in
+            if canRefresh && response == .alertSecondButtonReturn { self?.rescan() }
+        }
     }
-    @objc func showAbout() { alert("千里眼 2.0", "随时呼出，快速找到本地文件。\n\n\(activeShortcut?.label ?? "菜单栏") 呼出／收起 · esc 收起 · ↑↓ 选择 · ↩ 定位 Finder · ⌘⇧C 复制路径\n\n完全离线、文档只读。仅保存快捷键和外观设置，不保存文件索引、搜索词、目录路径或搜索历史。") }
     func alert(_ title: String, _ detail: String) { let a = NSAlert(); a.messageText = title; a.informativeText = detail; a.runModal() }
     func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {

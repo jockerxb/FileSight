@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import SearchCore
 
 func require(_ condition: @autoclosure () -> Bool, _ message: String) throws {
@@ -106,3 +107,73 @@ try require(isolated.snapshot().errorCount == 4, "未明确上报四个超时目
 try require(isolated.snapshot().entries.contains(where: { $0.name == "恢复验收.txt" }), "超时目录阻止了其余目录扫描")
 try require(Date().timeIntervalSince(started) < 8, "超时隔离没有生效")
 print("PASS：1207 个匹配文件、同名/隐藏/package、8 种排序、Unicode、刷新、取消、访问错误、四路阻塞隔离与 worker 重启均通过")
+
+// Reproduce the audit: an intermediate component is swapped for a link
+// after the directory was enqueued. The queued path still looks in-scope.
+let guarded = root.appendingPathComponent("guarded")
+let queued = guarded.appendingPathComponent("parent/child")
+let external = root.appendingPathComponent("outside/child")
+try fm.createDirectory(at: queued, withIntermediateDirectories: true)
+try fm.createDirectory(at: external, withIntermediateDirectories: true)
+try Data().write(to: external.appendingPathComponent("outside-scope.txt"))
+var rootInfo = stat()
+try require(lstat(guarded.path, &rootInfo) == 0, "读取测试根目录身份失败")
+let request = try JSONDecoder().decode(ScanRequest.self, from: JSONSerialization.data(withJSONObject: [
+    "path": queued.path, "includeRoot": false, "rootPath": guarded.path,
+    "rootIdentity": ["device": Int64(rootInfo.st_dev), "inode": rootInfo.st_ino]
+]))
+try fm.moveItem(at: guarded.appendingPathComponent("parent"), to: root.appendingPathComponent("old-parent"))
+try fm.createSymbolicLink(at: guarded.appendingPathComponent("parent"), withDestinationURL: external.deletingLastPathComponent())
+var blocked = false
+try DirectoryScanner.scan(request) { response in
+    try require(response.entries.isEmpty, "越界路径被列进索引")
+    blocked = blocked || !response.errors.isEmpty
+}
+try require(blocked, "符号链接替换未被明确拒绝")
+
+// No manual refresh: the real macOS event stream drives reconciliation.
+let live = root.appendingPathComponent("live")
+let left = live.appendingPathComponent("left")
+let right = live.appendingPathComponent("right")
+try fm.createDirectory(at: left, withIntermediateDirectories: true)
+try fm.createDirectory(at: right, withIntermediateDirectories: true)
+let original = left.appendingPathComponent("initial.txt")
+let untouched = right.appendingPathComponent("unchanged.txt")
+try Data().write(to: original)
+try Data().write(to: untouched)
+let watching = FileIndex()
+watching.start(roots: [live], watch: true)
+func waitFor(_ message: String, _ predicate: (ScanSnapshot) -> Bool) throws {
+    let end = Date().addingTimeInterval(10)
+    repeat {
+        if predicate(watching.snapshot()) { return }
+        Thread.sleep(forTimeInterval: 0.04)
+    } while Date() < end
+    let snapshot = watching.snapshot()
+    throw NSError(domain: "LiveIndexVerification", code: 1,
+                  userInfo: [NSLocalizedDescriptionKey: "\(message)，当前：\(snapshot.entries.map(\.name))，错误：\(snapshot.errors)"])
+}
+try waitFor("初始扫描或监听失败") { !$0.scanning && $0.errorCount == 0 && $0.entries.contains { $0.path == original.path } }
+let renamed = left.appendingPathComponent("renamed.txt")
+try fm.moveItem(at: original, to: renamed)
+try waitFor("同目录改名未同步") { snapshot in
+    snapshot.entries.contains { $0.path == renamed.path } && !snapshot.entries.contains { $0.path == original.path }
+}
+let nested = right.appendingPathComponent("fresh/deep")
+try fm.createDirectory(at: nested, withIntermediateDirectories: true)
+let moved = nested.appendingPathComponent("moved.txt")
+try fm.moveItem(at: renamed, to: moved)
+try waitFor("新子目录或跨目录移动未同步") { snapshot in
+    snapshot.entries.contains { $0.path == moved.path } && !snapshot.entries.contains { $0.path == renamed.path }
+}
+let changedDate = Date(timeIntervalSince1970: 1_735_689_600)
+try fm.setAttributes([.modificationDate: changedDate], ofItemAtPath: moved.path)
+try waitFor("修改时间未同步") { $0.entries.contains { $0.path == moved.path && $0.modified == changedDate } }
+try fm.removeItem(at: right.appendingPathComponent("fresh"))
+try waitFor("删除目录后索引仍有残留") { snapshot in
+    !snapshot.entries.contains { $0.path == moved.path || $0.path == nested.path } &&
+        snapshot.entries.contains { $0.path == untouched.path }
+}
+watching.start(roots: [])
+try require(watching.snapshot().entries.isEmpty, "撤换范围后结果未清空")
+print("PASS：拒绝父目录符号链接替换；真实文件事件自动处理改名、移动、新目录、修改与删除。")

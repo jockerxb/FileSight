@@ -71,6 +71,15 @@ final class LauncherHotKey {
         return true
     }
 
+    func suspend() {
+        if let registration { UnregisterEventHotKey(registration) }
+        registration = nil
+    }
+
+    func resume(_ shortcut: LauncherShortcut) {
+        if registration == nil { _ = register(shortcut) }
+    }
+
     deinit {
         if let registration { UnregisterEventHotKey(registration) }
         if let handler { RemoveEventHandler(handler) }

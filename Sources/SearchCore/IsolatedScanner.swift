@@ -1,10 +1,50 @@
 import Foundation
 import Darwin
 
+struct DirectoryIdentity: Codable, Equatable {
+    let device: Int32
+    let inode: UInt64
+    init(_ value: stat) { device = value.st_dev; inode = value.st_ino }
+}
+
+public struct ScanRoot {
+    public let path: String
+    let identity: DirectoryIdentity?
+    let bookmark: Data?
+
+    // The app calls this only with URLs returned by its directory picker.
+    // An implicit, in-memory bookmark transfers the picker grant to the worker.
+    public static func authorized(_ url: URL) throws -> Self {
+        guard url.isFileURL, url.path != "/", try LocalFiles.isLocal(url) else { throw POSIXError(.EACCES) }
+        let bookmark = try url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil)
+        let root = Self(url: url, bookmark: bookmark)
+        guard root.identity != nil else { throw POSIXError(.EACCES) }
+        return root
+    }
+
+    init(url: URL, bookmark: Data? = nil) {
+        path = FileIndex.canonicalRoot(url).path
+        var metadata = stat()
+        identity = lstat(path, &metadata) == 0 && metadata.st_mode & S_IFMT == S_IFDIR ? DirectoryIdentity(metadata) : nil
+        self.bookmark = bookmark
+    }
+
+    func contains(_ candidate: String) -> Bool {
+        candidate == path || candidate.hasPrefix(path == "/" ? "/" : path + "/")
+    }
+}
+
 public struct ScanRequest: Codable {
     public var path: String
     public var includeRoot: Bool
-    public var excludes: [String]
+    var rootPath: String
+    var rootIdentity: DirectoryIdentity?
+    var bookmark: Data?
+
+    init(path: String, root: ScanRoot) {
+        self.path = path; includeRoot = path == root.path
+        rootPath = root.path; rootIdentity = root.identity; bookmark = root.bookmark
+    }
 }
 
 public struct ScanResponse: Codable {
@@ -12,79 +52,147 @@ public struct ScanResponse: Codable {
     public var directories: [String] = []
     public var errors: [String] = []
     public var done: Bool = false
+    var identities: [String: DirectoryIdentity]? = nil
+    var failed: Bool? = nil
 }
 
 public enum DirectoryScanner {
-    private static func hasNoLocalData(_ url: URL, values: URLResourceValues) -> Bool {
-        if values.ubiquitousItemDownloadingStatus == .notDownloaded { return true }
-        // File Provider can return no ubiquitous download status at all. The
-        // filesystem's dataless flag still identifies its unmaterialized item.
-        var metadata = stat()
-        return lstat(url.path, &metadata) == 0 && metadata.st_flags & UInt32(SF_DATALESS) != 0
+    private static func lastError() -> POSIXError { POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+    private static let directoryFlags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+
+    private static func timestamp(_ value: timespec) -> Date {
+        value.tv_sec == 0 && value.tv_nsec == 0 ? .distantPast :
+            Date(timeIntervalSince1970: Double(value.tv_sec) + Double(value.tv_nsec) / 1_000_000_000)
     }
-    /// A worker handles one directory at a time. It never recurses by itself:
-    /// if a system call stalls, its supervisor can kill it and retain other work.
+
+    private static func entry(_ path: String, _ value: stat) -> FileEntry {
+        let ext = (path as NSString).pathExtension
+        let kind = value.st_mode & S_IFMT == S_IFDIR ? "文件夹" : ext.isEmpty ? "无扩展名" : ext
+        return FileEntry(path: path, modified: timestamp(value.st_mtimespec), created: timestamp(value.st_birthtimespec), kind: kind)
+    }
+
+    /// Follow only root-relative directory components, never a queued path or
+    /// a symlink. Directory descriptors keep each check tied to the object read.
     public static func scan(_ request: ScanRequest, emit: (ScanResponse) throws -> Void) throws {
-        let root = URL(fileURLWithPath: request.path, isDirectory: true)
-        guard try LocalFiles.isLocal(root) else {
-            try emit(ScanResponse(errors: ["\(root.path)：离线模式不扫描网络磁盘。"], done: true)); return
-        }
-        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isSymbolicLinkKey, .contentModificationDateKey, .creationDateKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey]
-        var batch = ScanResponse()
-        if request.includeRoot {
-            do {
-                let values = try root.resourceValues(forKeys: keys)
-                batch.entries.append(FileEntry(url: root, values: values))
-                if values.isDirectory == true && hasNoLocalData(root, values: values) {
-                    batch.errors.append("\(root.path)：云端目录尚未下载；已收录目录名称，内部文件未扫描。请先在 Finder 中下载后重新扫描。")
-                    batch.done = true; try emit(batch); return
-                }
+        var access: URL?
+        defer { access?.stopAccessingSecurityScopedResource() }
+        do {
+            guard let identity = request.rootIdentity else { throw POSIXError(.ENOENT) }
+            let prefix = request.rootPath == "/" ? "/" : request.rootPath + "/"
+            guard request.path == request.rootPath || request.path.hasPrefix(prefix) else { throw POSIXError(.EACCES) }
+            let relative = request.path == request.rootPath ? "" : String(request.path.dropFirst(prefix.count))
+            let components = relative.split(separator: "/", omittingEmptySubsequences: false)
+            guard relative.isEmpty || components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." && !$0.contains("\0") }) else {
+                throw POSIXError(.EINVAL)
             }
-            catch { batch.errors.append("\(root.path)：\(error.localizedDescription)") }
-        }
-        try emit(batch)
-        batch = ScanResponse()
-        guard let iterator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: Array(keys), options: [.skipsSubdirectoryDescendants], errorHandler: { url, error in
-            batch.errors.append("\(url.path)：\(error.localizedDescription)")
-            return true
-        }) else {
-            try emit(ScanResponse(errors: ["\(root.path)：无法枚举目录"], done: true)); return
-        }
-        var lastEmission = Date()
-        // nextObject avoids NSFastEnumeration buffering a whole batch behind a
-        // protected directory before delivering even the first available result.
-        while let url = iterator.nextObject() as? URL {
-            if request.excludes.contains(url.path) { continue }
-            do {
-                let values = try url.resourceValues(forKeys: keys)
-                batch.entries.append(FileEntry(url: url, values: values))
-                if values.isDirectory == true && values.isSymbolicLink != true {
-                    if try !LocalFiles.isLocal(url) {
-                        batch.errors.append("\(url.path)：离线模式不扫描网络磁盘。")
-                    } else if hasNoLocalData(url, values: values) {
-                        batch.errors.append("\(url.path)：云端目录尚未下载；已收录目录名称，内部文件未扫描。请先在 Finder 中下载后重新扫描。")
-                    } else {
-                        batch.directories.append(url.path)
+            let root: String
+            if let bookmark = request.bookmark {
+                var stale = false
+                let resolved = try URL(resolvingBookmarkData: bookmark, options: [.withoutUI, .withoutMounting], relativeTo: nil, bookmarkDataIsStale: &stale)
+                access = resolved
+                guard resolved.isFileURL, !stale, resolved.path == request.rootPath else { throw POSIXError(.ESTALE) }
+                root = resolved.path
+            } else { root = request.rootPath }
+
+            var rootMetadata = stat()
+            guard fstatat(AT_FDCWD, root, &rootMetadata, AT_SYMLINK_NOFOLLOW_ANY) == 0 else { throw lastError() }
+            guard DirectoryIdentity(rootMetadata) == identity else { throw POSIXError(.ESTALE) }
+            if rootMetadata.st_flags & UInt32(SF_DATALESS) != 0 {
+                try emit(ScanResponse(entries: request.includeRoot ? [entry(request.path, rootMetadata)] : [],
+                                      errors: ["\(root)：云端目录尚未下载，内部未扫描。"], done: true))
+                return
+            }
+            var descriptor = open(root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW_ANY | O_CLOEXEC)
+            guard descriptor >= 0 else { throw lastError() }
+            defer { close(descriptor) }
+            var metadata = stat()
+            guard fstat(descriptor, &metadata) == 0 else { throw lastError() }
+            guard DirectoryIdentity(metadata) == identity else { throw POSIXError(.ESTALE) }
+            var volume = statfs()
+            guard fstatfs(descriptor, &volume) == 0 else { throw lastError() }
+            guard volume.f_flags & UInt32(MNT_LOCAL) != 0 else { throw POSIXError(.EXDEV) }
+            for component in components where !relative.isEmpty {
+                var child = stat()
+                guard fstatat(descriptor, String(component), &child, AT_SYMLINK_NOFOLLOW) == 0 else { throw lastError() }
+                guard child.st_dev == identity.device, child.st_mode & S_IFMT == S_IFDIR,
+                      child.st_flags & UInt32(SF_DATALESS) == 0 else { throw POSIXError(.EACCES) }
+                let next = openat(descriptor, String(component), directoryFlags)
+                guard next >= 0 else { throw lastError() }
+                close(descriptor); descriptor = next
+                guard fstat(descriptor, &metadata) == 0 else { throw lastError() }
+                guard DirectoryIdentity(metadata) == DirectoryIdentity(child) else { throw POSIXError(.ESTALE) }
+            }
+            // A moved directory descriptor must not become a source of results
+            // under its old name. This check also detects replacement by a link.
+            func verifyLocation() throws {
+                var bytes = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+                guard fcntl(descriptor, F_GETPATH, &bytes) == 0 else { throw lastError() }
+                guard String(cString: bytes) == request.path else { throw POSIXError(.ESTALE) }
+            }
+            try verifyLocation()
+            var batch = ScanResponse()
+            if request.includeRoot { batch.entries.append(entry(request.path, metadata)) }
+            if metadata.st_flags & UInt32(SF_DATALESS) != 0 {
+                batch.errors.append("\(request.path)：云端目录尚未下载，内部未扫描。")
+                batch.done = true
+                try emit(batch)
+                return
+            }
+            let duplicate = dup(descriptor)
+            guard duplicate >= 0 else { throw lastError() }
+            guard let directory = fdopendir(duplicate) else { let error = lastError(); close(duplicate); throw error }
+            defer { closedir(directory) }
+            var last = ProcessInfo.processInfo.systemUptime
+            while true {
+                errno = 0
+                guard let item = readdir(directory) else {
+                    if errno != 0 { throw lastError() }
+                    break
+                }
+                let length = Int(item.pointee.d_namlen)
+                let name = withUnsafeBytes(of: &item.pointee.d_name) { String(bytes: $0.prefix(length), encoding: .utf8) }
+                guard let name, name != ".", name != ".." else { continue }
+                let path = (request.path == "/" ? "/" : request.path + "/") + name
+                var child = stat()
+                if fstatat(descriptor, name, &child, AT_SYMLINK_NOFOLLOW) == 0 {
+                    batch.entries.append(entry(path, child))
+                    if child.st_mode & S_IFMT == S_IFDIR {
+                        if child.st_dev != identity.device {
+                            batch.errors.append("\(path)：不跨越挂载点，请单独选择该磁盘。")
+                        } else if child.st_flags & UInt32(SF_DATALESS) != 0 {
+                            batch.errors.append("\(path)：云端目录尚未下载，内部未扫描。")
+                        } else {
+                            batch.directories.append(path)
+                            if batch.identities == nil { batch.identities = [:] }
+                            batch.identities?[path] = DirectoryIdentity(child)
+                        }
                     }
+                } else if errno != ENOENT {
+                    batch.errors.append("\(path)：\(lastError().localizedDescription)")
                 }
-            } catch { batch.errors.append("\(url.path)：\(error.localizedDescription)") }
-            if batch.entries.count >= 512 || Date().timeIntervalSince(lastEmission) >= 0.4 {
-                try emit(batch); batch = ScanResponse(); lastEmission = Date()
+                if batch.entries.count + batch.errors.count >= 512 || ProcessInfo.processInfo.systemUptime - last >= 0.4 {
+                    try verifyLocation()
+                    try emit(batch); batch = ScanResponse(); last = ProcessInfo.processInfo.systemUptime
+                }
             }
+            try verifyLocation()
+            batch.done = true
+            try emit(batch)
+        } catch {
+            try emit(ScanResponse(errors: ["\(request.path)：\(error.localizedDescription)"], done: true, failed: true))
         }
-        batch.done = true
-        try emit(batch)
     }
 }
 
-struct DirectoryJob { let path: String; let includeRoot: Bool }
+struct DirectoryJob { let path: String; let root: ScanRoot; let recursive: Bool }
 
 final class DirectoryJobs {
     private let condition = NSCondition()
     private var pending: [DirectoryJob]
+    private var seen: Set<String>
     private var cursor = 0
     private var active = 0
-    init(roots: [URL]) { pending = roots.map { DirectoryJob(path: $0.path, includeRoot: true) } }
+    init(_ jobs: [DirectoryJob]) { pending = jobs; seen = Set(jobs.map(\.path)) }
     func next(token: ScanToken) -> DirectoryJob? {
         condition.lock(); defer { condition.unlock() }
         while cursor == pending.count && active > 0 && !token.cancelled { _ = condition.wait(until: Date().addingTimeInterval(0.2)) }
@@ -94,9 +202,9 @@ final class DirectoryJobs {
         if cursor > 4096 { pending.removeFirst(cursor); cursor = 0 }
         return job
     }
-    func complete(children: [String]) {
+    func complete(children: [DirectoryJob]) {
         condition.lock(); defer { condition.unlock() }
-        pending.append(contentsOf: children.map { DirectoryJob(path: $0, includeRoot: false) })
+        pending.append(contentsOf: children.filter { seen.insert($0.path).inserted })
         active -= 1; condition.broadcast()
     }
 }
@@ -158,6 +266,7 @@ final class ScanWorkerSession {
                     if count < 0 && errno == EINTR { continue }
                     guard count > 0 else { break }
                     activity.touch(); buffer.append(contentsOf: bytes.prefix(count))
+                    guard buffer.count <= 8 * 1024 * 1024 else { throw POSIXError(.EMSGSIZE) }
                 }
             }
             if !token.cancelled {
@@ -172,10 +281,10 @@ final class ScanWorkerSession {
 
 private final class WorkerActivity {
     private let lock = NSLock()
-    private var last = Date()
+    private var last = ProcessInfo.processInfo.systemUptime
     private var wasInterrupted = false
-    func touch() { lock.lock(); last = Date(); lock.unlock() }
-    func expired(after timeout: TimeInterval) -> Bool { lock.lock(); defer { lock.unlock() }; return Date().timeIntervalSince(last) > timeout }
+    func touch() { lock.lock(); last = ProcessInfo.processInfo.systemUptime; lock.unlock() }
+    func expired(after timeout: TimeInterval) -> Bool { lock.lock(); defer { lock.unlock() }; return ProcessInfo.processInfo.systemUptime - last > timeout }
     func markInterrupted() { lock.lock(); wasInterrupted = true; lock.unlock() }
     var interrupted: Bool { lock.lock(); defer { lock.unlock() }; return wasInterrupted }
 }

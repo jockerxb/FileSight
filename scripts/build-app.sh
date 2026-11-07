@@ -5,9 +5,25 @@ export CLANG_MODULE_CACHE_PATH="$PWD/.build/clang-cache"
 export SWIFTPM_MODULECACHE_OVERRIDE="$PWD/.build/module-cache"
 swift build --disable-sandbox --cache-path .build/cache -c release --product QianLiYan
 swift build --disable-sandbox --cache-path .build/cache -c release --product ScanWorker
-app="$PWD/dist/千里眼.app"
+mkdir -p "$PWD/dist"
+staging=$(mktemp -d "$PWD/.build/filesight-package.XXXXXX")
+trap 'rm -rf "$staging"' EXIT
+app="$staging/千里眼.app"
+signature=(--sign -)
+case "${1:---preview}" in
+    --preview) ;;
+    --sign-for-distribution)
+        identity=${FILESIGHT_SIGN_IDENTITY:-}
+        if [[ "$identity" != 'Developer ID Application:'* ]]; then
+            print -u2 '需要有效的 Developer ID Application 签名身份。'
+            exit 1
+        fi
+        signature=(--sign "$identity" --options runtime --timestamp)
+        ;;
+    *) print -u2 '用法：build-app.sh [--preview|--sign-for-distribution]'; exit 1 ;;
+esac
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-iconset="$PWD/.build/QianLiYan.iconset"
+iconset="$staging/QianLiYan.iconset"
 mkdir -p "$iconset"
 for size in 16 32 128 256 512; do
     sips -z "$size" "$size" assets/branding/qianliyan-app-icon.png --out "$iconset/icon_${size}x${size}.png" >/dev/null
@@ -27,22 +43,25 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
 <key>CFBundleDisplayName</key><string>千里眼</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleIconFile</key><string>QianLiYan.icns</string>
-<key>CFBundleShortVersionString</key><string>2.0</string>
-<key>CFBundleVersion</key><string>10</string>
+<key>CFBundleShortVersionString</key><string>2.1</string>
+<key>CFBundleVersion</key><string>15</string>
 <key>LSUIElement</key><true/>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSPrincipalClass</key><string>NSApplication</string>
-<key>NSDocumentsFolderUsageDescription</key><string>扫描文稿目录中的文件名以提供搜索。</string>
-<key>NSDesktopFolderUsageDescription</key><string>扫描桌面上的文件名以提供搜索。</string>
-<key>NSDownloadsFolderUsageDescription</key><string>扫描下载目录中的文件名以提供搜索。</string>
-<key>NSRemovableVolumesUsageDescription</key><string>搜索已挂载磁盘中的文件名。</string>
 </dict></plist>
 PLIST
-codesign --force --sign - --entitlements Security/Worker.entitlements "$app/Contents/MacOS/ScanWorker"
-codesign --force --sign - --entitlements Security/App.entitlements "$app"
-codesign --verify --strict "$app"
+codesign --force "${signature[@]}" --entitlements Security/Worker.entitlements "$app/Contents/MacOS/ScanWorker"
+codesign --force "${signature[@]}" --entitlements Security/App.entitlements "$app"
 python3 scripts/verify-entitlements.py "$app"
-archive="$PWD/dist/FileSight.zip"
+archive="$staging/FileSight.zip"
 ditto -c -k --sequesterRsrc --keepParent "$app" "$archive"
-print "已打包：$archive（内含千里眼.app）"
+if [[ -e "$PWD/dist/千里眼.app" ]]; then
+    mv "$PWD/dist/千里眼.app" "$staging/previous.app"
+fi
+if ! mv "$app" "$PWD/dist/千里眼.app"; then
+    if [[ -e "$staging/previous.app" ]]; then mv "$staging/previous.app" "$PWD/dist/千里眼.app"; fi
+    exit 1
+fi
+mv -f "$archive" "$PWD/dist/FileSight.zip"
+print '已打包未公证的构建：dist/FileSight.zip'
