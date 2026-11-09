@@ -131,6 +131,20 @@ try DirectoryScanner.scan(request) { response in
 }
 try require(blocked, "符号链接替换未被明确拒绝")
 
+// A directory can disappear after FSEvents enqueues it. This must clear the
+// stale record without presenting a false access/permission warning.
+let vanished = guarded.appendingPathComponent("vanished")
+try fm.createDirectory(at: vanished, withIntermediateDirectories: true)
+let vanishedRequest = try JSONDecoder().decode(ScanRequest.self, from: JSONSerialization.data(withJSONObject: [
+    "path": vanished.path, "includeRoot": false, "rootPath": guarded.path,
+    "rootIdentity": ["device": Int64(rootInfo.st_dev), "inode": rootInfo.st_ino]
+]))
+try fm.removeItem(at: vanished)
+var vanishedResponse: ScanResponse?
+try DirectoryScanner.scan(vanishedRequest) { vanishedResponse = $0 }
+try require(vanishedResponse?.errors.isEmpty == true && vanishedResponse?.done == true,
+            "已删除目录被错误报告为访问失败")
+
 // No manual refresh: the real macOS event stream drives reconciliation.
 let live = root.appendingPathComponent("live")
 let left = live.appendingPathComponent("left")

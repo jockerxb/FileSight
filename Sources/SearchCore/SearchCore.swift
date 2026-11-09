@@ -8,6 +8,8 @@ public struct FileEntry: Equatable, Codable {
     public let created: Date
     public let kind: String
     public let searchableName: String
+    public let searchablePhonetic: String
+    public let searchableText: String
 
     public init(url: URL, values: URLResourceValues) {
         path = url.path
@@ -16,6 +18,8 @@ public struct FileEntry: Equatable, Codable {
         created = values.creationDate ?? .distantPast
         kind = values.isDirectory == true ? "文件夹" : (url.pathExtension.isEmpty ? "无扩展名" : url.pathExtension.lowercased())
         searchableName = Self.normalize(name)
+        searchablePhonetic = Self.phoneticText(name)
+        searchableText = [searchableName, searchablePhonetic].filter { !$0.isEmpty }.joined(separator: " ")
     }
 
     public init(path: String, modified: Date, created: Date, kind: String) {
@@ -25,10 +29,85 @@ public struct FileEntry: Equatable, Codable {
         self.created = created
         self.kind = kind.lowercased()
         self.searchableName = Self.normalize(name)
+        self.searchablePhonetic = Self.phoneticText(name)
+        self.searchableText = [searchableName, searchablePhonetic].filter { !$0.isEmpty }.joined(separator: " ")
     }
 
     public static func normalize(_ text: String) -> String {
         text.precomposedStringWithCanonicalMapping.folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+    }
+
+    /// Original text plus compact Pinyin and Pinyin initials. Only CJK
+    /// characters are transliterated; ordinary Latin filenames keep their
+    /// existing deterministic matching behavior.
+    public static func searchText(_ text: String) -> String {
+        let original = normalize(text)
+        let phonetic = phoneticText(text)
+        return [original, phonetic].filter { !$0.isEmpty }.joined(separator: " ")
+    }
+
+    public static func phoneticText(_ text: String) -> String {
+        var syllables: [String] = []
+        for character in text {
+            guard let scalar = character.unicodeScalars.first(where: isCJK) else { continue }
+            let syllable = PinyinCache.value(for: scalar)
+            if !syllable.isEmpty { syllables.append(syllable) }
+        }
+        guard !syllables.isEmpty else { return "" }
+        let compact = syllables.joined()
+        let initials = syllables.compactMap(\.first).map(String.init).joined()
+        return [compact, initials].joined(separator: " ")
+    }
+
+    private static func isCJK(_ scalar: UnicodeScalar) -> Bool {
+        switch scalar.value {
+        case 0x3400...0x9FFF, 0x20000...0x2FA1F: true
+        default: false
+        }
+    }
+
+    private enum PinyinCache {
+        static let lock = NSLock()
+        nonisolated(unsafe) static var values: [UnicodeScalar: String] = [:]
+
+        static func value(for scalar: UnicodeScalar) -> String {
+            lock.lock()
+            if let cached = values[scalar] { lock.unlock(); return cached }
+            lock.unlock()
+            let latin = String(scalar).applyingTransform(.toLatin, reverse: false) ?? ""
+            let normalized = FileEntry.normalize(latin)
+            let ascii = normalized.unicodeScalars.filter { $0.isASCII && CharacterSet.alphanumerics.contains($0) }
+            let result = String(String.UnicodeScalarView(ascii))
+            lock.lock(); values[scalar] = result; lock.unlock()
+            return result
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey { case path, name, modified, created, kind, searchableName, searchablePhonetic, searchableText }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        path = try values.decode(String.self, forKey: .path)
+        name = try values.decodeIfPresent(String.self, forKey: .name) ?? URL(fileURLWithPath: path).lastPathComponent
+        modified = try values.decode(Date.self, forKey: .modified)
+        created = try values.decode(Date.self, forKey: .created)
+        kind = try values.decode(String.self, forKey: .kind)
+        searchableName = try values.decodeIfPresent(String.self, forKey: .searchableName) ?? Self.normalize(name)
+        searchablePhonetic = try values.decodeIfPresent(String.self, forKey: .searchablePhonetic) ?? Self.phoneticText(name)
+        searchableText = try values.decodeIfPresent(String.self, forKey: .searchableText) ??
+            [searchableName, searchablePhonetic].filter { !$0.isEmpty }.joined(separator: " ")
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(path, forKey: .path)
+        try values.encode(name, forKey: .name)
+        try values.encode(modified, forKey: .modified)
+        try values.encode(created, forKey: .created)
+        try values.encode(kind, forKey: .kind)
+        try values.encode(searchableName, forKey: .searchableName)
+        try values.encode(searchablePhonetic, forKey: .searchablePhonetic)
+        try values.encode(searchableText, forKey: .searchableText)
     }
 }
 

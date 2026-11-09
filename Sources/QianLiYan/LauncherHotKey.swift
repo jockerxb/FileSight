@@ -47,14 +47,16 @@ struct LauncherShortcut: Codable {
 final class LauncherHotKey {
     private var handler: EventHandlerRef?
     private var registration: EventHotKeyRef?
-    var action: (() -> Void)?
+    var action: ((TimeInterval) -> Void)?
 
     init() {
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), { _, _, context in
+        InstallEventHandler(GetApplicationEventTarget(), { _, event, context in
             guard let context else { return OSStatus(eventNotHandledErr) }
             let owner = Unmanaged<LauncherHotKey>.fromOpaque(context).takeUnretainedValue()
-            owner.action?()
+            let eventTime = event.map(GetEventTime) ?? ProcessInfo.processInfo.systemUptime
+            if Thread.isMainThread { owner.action?(eventTime) }
+            else { DispatchQueue.main.async { [weak owner] in owner?.action?(eventTime) } }
             return noErr
         }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), &handler)
     }

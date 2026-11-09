@@ -28,6 +28,15 @@ public struct NameFingerprint {
 public struct SearchPage {
     public let entries: [FileEntry]
     let fingerprints: [NameFingerprint]
-    public init(entries: [FileEntry]) { self.entries = entries; fingerprints = entries.map { NameFingerprint(normalized: $0.searchableName) } }
-    init(entries: [FileEntry], fingerprints: [NameFingerprint]) { self.entries = entries; self.fingerprints = fingerprints }
+    let phoneticFingerprints: [NameFingerprint]
+    public init(entries: [FileEntry]) {
+        self.entries = entries
+        fingerprints = entries.map { NameFingerprint(normalized: $0.searchableName) }
+        phoneticFingerprints = entries.map { NameFingerprint(normalized: $0.searchablePhonetic) }
+    }
+    init(entries: [FileEntry], fingerprints: [NameFingerprint], phoneticFingerprints: [NameFingerprint]) {
+        self.entries = entries
+        self.fingerprints = fingerprints
+        self.phoneticFingerprints = phoneticFingerprints
+    }
 }

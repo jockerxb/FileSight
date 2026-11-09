@@ -78,10 +78,36 @@ final class LauncherDropdown: NSButton {
     }
 }
 
+final class FilterChip: NSButton {
+    var onRemove: (() -> Void)?
+
+    init(label: String) {
+        super.init(frame: .zero)
+        title = ""
+        bezelStyle = .recessed
+        isBordered = true
+        font = .systemFont(ofSize: 10, weight: .medium)
+        target = self; action = #selector(removeFilter)
+        setAccessibilityLabel(label)
+        isHidden = true
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func show(_ value: String?) {
+        guard let value, !value.isEmpty else { isHidden = true; title = ""; return }
+        title = value + "  ×"
+        setAccessibilityValue(value)
+        isHidden = false
+    }
+
+    @objc private func removeFilter() { onRemove?() }
+}
+
 final class SearchPanel: NSPanel {
+    var onCancel: (() -> Void)?
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
-    override func cancelOperation(_ sender: Any?) { orderOut(nil) }
+    override func cancelOperation(_ sender: Any?) { onCancel?() ?? orderOut(nil) }
 }
 
 final class ResultRow: NSTableRowView {
@@ -141,6 +167,20 @@ final class ResultCell: NSTableCellView {
         kind.stringValue = entry.kind == "文件夹" ? "文件夹" : entry.kind.uppercased()
         detail.stringValue = date
         glyph.image = NSImage(systemSymbolName: entry.kind == "文件夹" ? "folder" : "doc.text", accessibilityDescription: entry.kind)
+        toolTip = entry.path
+        filename.setAccessibilityLabel(entry.name)
+        location.setAccessibilityLabel(entry.path)
+    }
+
+    func showApplication(_ entry: ApplicationEntry) {
+        filename.stringValue = entry.name
+        let home = LocalFiles.userHome.path
+        let parent = (entry.path as NSString).deletingLastPathComponent
+        location.stringValue = parent == home ? "~" : parent.hasPrefix(home + "/") ? "~" + parent.dropFirst(home.count) : parent
+        kind.stringValue = "APP"
+        detail.stringValue = "应用"
+        glyph.image = NSWorkspace.shared.icon(forFile: entry.path)
+        glyph.imageScaling = .scaleProportionallyUpOrDown
         toolTip = entry.path
         filename.setAccessibilityLabel(entry.name)
         location.setAccessibilityLabel(entry.path)

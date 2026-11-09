@@ -12,14 +12,45 @@ public struct ScanRoot {
     let identity: DirectoryIdentity?
     let bookmark: Data?
 
+    public var authorizationBookmark: Data? { bookmark }
+
     // The app calls this only with URLs returned by its directory picker.
-    // An implicit, in-memory bookmark transfers the picker grant to the worker.
+    // A security-scoped bookmark transfers the read-only picker grant to the
+    // worker and can be restored by the same signed app on a later launch.
     public static func authorized(_ url: URL) throws -> Self {
         guard url.isFileURL, url.path != "/", try LocalFiles.isLocal(url) else { throw POSIXError(.EACCES) }
-        let bookmark = try url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil)
+        let bookmark = try url.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
         let root = Self(url: url, bookmark: bookmark)
         guard root.identity != nil else { throw POSIXError(.EACCES) }
         return root
+    }
+
+    public static func restored(_ bookmark: Data) throws -> Self {
+        var stale = false
+        let url = try URL(resolvingBookmarkData: bookmark,
+                          options: [.withSecurityScope, .withoutUI, .withoutMounting],
+                          relativeTo: nil, bookmarkDataIsStale: &stale)
+        guard url.isFileURL, url.path != "/", !stale,
+              url.startAccessingSecurityScopedResource() else { throw POSIXError(.EACCES) }
+        defer { url.stopAccessingSecurityScopedResource() }
+        guard try LocalFiles.isLocal(url) else { throw POSIXError(.EACCES) }
+        let root = Self(url: url, bookmark: bookmark)
+        guard root.identity != nil else { throw POSIXError(.EACCES) }
+        return root
+    }
+
+    /// Keep the app-scoped grant active while scanner child processes run.
+    /// The helper inherits this narrowed sandbox extension; the persistent
+    /// bookmark itself never leaves the main app.
+    public func startAccessing() throws -> URL {
+        guard let bookmark else { throw POSIXError(.EACCES) }
+        var stale = false
+        let url = try URL(resolvingBookmarkData: bookmark,
+                          options: [.withSecurityScope, .withoutUI, .withoutMounting],
+                          relativeTo: nil, bookmarkDataIsStale: &stale)
+        guard url.isFileURL, !stale, FileIndex.canonicalRoot(url).path == path,
+              url.startAccessingSecurityScopedResource() else { throw POSIXError(.EACCES) }
+        return url
     }
 
     init(url: URL, bookmark: Data? = nil) {
@@ -39,11 +70,10 @@ public struct ScanRequest: Codable {
     public var includeRoot: Bool
     var rootPath: String
     var rootIdentity: DirectoryIdentity?
-    var bookmark: Data?
 
     init(path: String, root: ScanRoot) {
         self.path = path; includeRoot = path == root.path
-        rootPath = root.path; rootIdentity = root.identity; bookmark = root.bookmark
+        rootPath = root.path; rootIdentity = root.identity
     }
 }
 
@@ -74,8 +104,6 @@ public enum DirectoryScanner {
     /// Follow only root-relative directory components, never a queued path or
     /// a symlink. Directory descriptors keep each check tied to the object read.
     public static func scan(_ request: ScanRequest, emit: (ScanResponse) throws -> Void) throws {
-        var access: URL?
-        defer { access?.stopAccessingSecurityScopedResource() }
         do {
             guard let identity = request.rootIdentity else { throw POSIXError(.ENOENT) }
             let prefix = request.rootPath == "/" ? "/" : request.rootPath + "/"
@@ -85,14 +113,7 @@ public enum DirectoryScanner {
             guard relative.isEmpty || components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." && !$0.contains("\0") }) else {
                 throw POSIXError(.EINVAL)
             }
-            let root: String
-            if let bookmark = request.bookmark {
-                var stale = false
-                let resolved = try URL(resolvingBookmarkData: bookmark, options: [.withoutUI, .withoutMounting], relativeTo: nil, bookmarkDataIsStale: &stale)
-                access = resolved
-                guard resolved.isFileURL, !stale, resolved.path == request.rootPath else { throw POSIXError(.ESTALE) }
-                root = resolved.path
-            } else { root = request.rootPath }
+            let root = request.rootPath
 
             var rootMetadata = stat()
             guard fstatat(AT_FDCWD, root, &rootMetadata, AT_SYMLINK_NOFOLLOW_ANY) == 0 else { throw lastError() }
@@ -178,6 +199,13 @@ public enum DirectoryScanner {
             try verifyLocation()
             batch.done = true
             try emit(batch)
+        } catch let error as POSIXError where request.path != request.rootPath &&
+            (error.code == .ENOENT || error.code == .ESTALE || error.code == .ENOTDIR) {
+            // FSEvents can enqueue a directory just before it is deleted,
+            // renamed, or replaced. That is a normal reconciliation outcome,
+            // not a permission failure. Committing an empty successful result
+            // removes any stale record for the vanished path.
+            try emit(ScanResponse(done: true))
         } catch {
             try emit(ScanResponse(errors: ["\(request.path)：\(error.localizedDescription)"], done: true, failed: true))
         }

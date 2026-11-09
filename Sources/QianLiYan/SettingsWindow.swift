@@ -25,11 +25,13 @@ final class SettingsWindow: NSWindowController, NSWindowDelegate {
     private let loginSwitch = NSSwitch()
     private let loginHint = NSTextField(labelWithString: "登录后显示在菜单栏")
     private let loginSettings = NSButton()
+    private let clearDirectoryAuthorization = NSButton()
     private let loginService = SMAppService.mainApp
     var onTheme: ((LauncherTheme) -> Void)?
     var onShortcut: ((LauncherShortcut) -> Bool)?
     var onRecording: ((Bool) -> Void)?
     var onDiagnostics: (() -> Void)?
+    var onClearDirectoryAuthorization: (() -> Void)?
 
     init(productTitle: String) {
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 466, height: 276),
@@ -58,6 +60,9 @@ final class SettingsWindow: NSWindowController, NSWindowDelegate {
         loginLabel.orientation = .vertical; loginLabel.alignment = .leading; loginLabel.spacing = 3
 
         let diagnosticButton = NSButton(title: "搜索诊断…", target: self, action: #selector(showDiagnostics))
+        clearDirectoryAuthorization.title = "取消授权…"
+        clearDirectoryAuthorization.target = self
+        clearDirectoryAuthorization.action = #selector(clearAuthorization)
         let gitHub = NSButton(title: "查看 GitHub ↗", target: self, action: #selector(openGitHub))
         let version = NSTextField(labelWithString: productTitle)
         version.textColor = .secondaryLabelColor
@@ -68,7 +73,7 @@ final class SettingsWindow: NSWindowController, NSWindowDelegate {
             Self.row([NSTextField(labelWithString: "呼出快捷键"), NSView(), shortcutValue]),
             Self.row([loginLabel, NSView(), loginSettings, loginSwitch]),
             divider,
-            Self.row([NSTextField(labelWithString: "索引与目录访问"), NSView(), diagnosticButton]),
+            Self.row([NSTextField(labelWithString: "索引与目录访问"), NSView(), clearDirectoryAuthorization, diagnosticButton]),
             Self.row([version, NSView(), gitHub])
         ]
         let stack = NSStackView(views: rows)
@@ -98,9 +103,10 @@ final class SettingsWindow: NSWindowController, NSWindowDelegate {
         return row
     }
 
-    func update(theme: LauncherTheme, shortcut: LauncherShortcut?) {
+    func update(theme: LauncherTheme, shortcut: LauncherShortcut?, hasDirectoryAuthorization: Bool) {
         appearancePicker.selectItem(at: theme.rawValue)
         shortcutValue.shortcut = shortcut
+        clearDirectoryAuthorization.isEnabled = hasDirectoryAuthorization
         refreshLoginItem()
     }
 
@@ -138,6 +144,7 @@ final class SettingsWindow: NSWindowController, NSWindowDelegate {
     func windowDidResignKey(_ notification: Notification) { shortcutValue.cancelRecording() }
     func windowWillClose(_ notification: Notification) { shortcutValue.cancelRecording() }
     @objc private func showDiagnostics() { onDiagnostics?() }
+    @objc private func clearAuthorization() { onClearDirectoryAuthorization?() }
     @objc private func openGitHub() {
         // Hand only the fixed project URL to the user's browser.
         guard let url = URL(string: "https://github.com/jockerxb/FileSight") else { return }

@@ -6,7 +6,7 @@
 
 **Find your files. Keep them private.**
 
-FileSight is a native macOS filename search app. Press a shortcut, type part of a filename, and find it in Downloads or a folder you choose. Reveal the result in Finder when you need it. No accounts, uploads, or online search; no document editing or deletion actions.
+FileSight is a native macOS local search app. Press a shortcut to launch an installed app or find a file in Downloads or a folder you choose. Reveal files in Finder when needed. No accounts, uploads, or online search; no document editing or deletion actions.
 
 [Download v2.1 preview](https://github.com/jockerxb/FileSight/releases/tag/v2.1) · [Detailed guide (中文)](docs/USER_GUIDE.zh-CN.md) · [Source code](https://github.com/jockerxb/FileSight)
 
@@ -17,16 +17,20 @@ Your Downloads folder is full of invoices, spreadsheets, and reference files. Yo
 ## Features
 
 - **A shortcut away:** Lives in the menu bar. Press `⌘↑` to search, or click the shortcut field in Settings to record your own combination.
+- **Launch local apps:** App results do not wait for file search and match localized names, original names, Pinyin, and initials. Press Return to launch one.
 - **Filename search:** Chinese, English, extensions, and multiple space-separated keywords. Separate paths distinguish files with the same name.
+- **Pinyin and initials:** Find Chinese app and file names using full Pinyin or their initials.
+- **Type and date filters:** For example, `最近1个月 发票 pdf` finds invoice PDFs modified in the last month and shows removable filter chips.
 - **Flexible sorting:** Exact names first, then prefix and substring matches; newest modification first within each tier. You can also sort by modification date, creation date, file type, or filename.
 - **Automatic index updates:** Tracks changes in authorized folders while running, without a daily full-folder scan.
+- **Responsive by design:** The shortcut paints and focuses the panel before reading index state; broad searches return the best current results instead of waiting indefinitely.
 - **Simple settings:** Light, dark, or system appearance and optional launch at login. Reveal results in Finder or copy their paths.
 
 ## Privacy and file safety
 
-Search reads names, paths, timestamps, and other metadata, not document contents. Both the app and its scanner use App Sandbox with no network entitlements and read-only access to authorized folders. The index and queries stay in memory and are not retained after quitting.
+Search reads installed-app names and icons plus file names, paths, timestamps, and other metadata, not document contents. App discovery uses standard local macOS application locations and is independent of the authorized file-search folder. Both the app and its scanner use App Sandbox with no network entitlements and read-only access to authorized folders. The index and queries stay in memory and are not retained after quitting.
 
-Select a folder to authorize search; select it again after restarting the app. FileSight skips network volumes, does not follow symbolic links, and does not request cloud-file downloads. Clicking the GitHub button explicitly opens the project page in your browser.
+File search defaults to Downloads. Authorize a folder once; its read-only security-scoped bookmark is kept inside the app sandbox and restored on later launches, and can be revoked in Settings. FileSight skips network volumes, does not follow symbolic links, and does not request cloud-file downloads. Clicking the GitHub button explicitly opens the project page in your browser.
 
 [Privacy design and verification (中文)](PRIVACY.md)
 
@@ -34,7 +38,7 @@ Select a folder to authorize search; select it again after restarting the app. F
 
 1. Download `FileSight.zip` from the release, unzip it, and move **千里眼.app** into **Applications**.
 2. Open the app. Click **授权下载…** (Authorize Downloads), or choose a local folder from the scope menu.
-3. Type a filename. Use `↑↓` to select, `Return` to reveal in Finder, and `Esc` to dismiss.
+3. Type an app or filename. `Return` launches an app or reveals a file in Finder; `Esc` dismisses the panel.
 
 Right-click the menu bar icon → **设置…** (Settings) to change appearance, the shortcut, or launch at login. `⌘↑` is also Finder's parent-folder shortcut; record another combination if needed.
 

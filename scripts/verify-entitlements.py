@@ -5,6 +5,7 @@ root = Path(__file__).resolve().parent.parent
 app = Path(sys.argv[1]) if len(sys.argv) > 1 else root/'dist/千里眼.app'
 expected_app = {
     'com.apple.security.app-sandbox': True,
+    'com.apple.security.files.bookmarks.app-scope': True,
     'com.apple.security.files.user-selected.read-only': True,
 }
 expected_worker = {'com.apple.security.app-sandbox': True, 'com.apple.security.inherit': True}
