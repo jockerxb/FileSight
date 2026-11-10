@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import CoreServices
 
 public struct FileEntry: Equatable, Codable {
     public let path: String
@@ -31,6 +32,18 @@ public struct FileEntry: Equatable, Codable {
         self.searchableName = Self.normalize(name)
         self.searchablePhonetic = Self.phoneticText(name)
         self.searchableText = [searchableName, searchablePhonetic].filter { !$0.isEmpty }.joined(separator: " ")
+    }
+
+    init(path: String, modified: Date, created: Date, kind: String, searchableName: String,
+         searchablePhonetic: String, searchableText: String) {
+        self.path = path
+        self.name = URL(fileURLWithPath: path).lastPathComponent
+        self.modified = modified
+        self.created = created
+        self.kind = kind
+        self.searchableName = searchableName
+        self.searchablePhonetic = searchablePhonetic
+        self.searchableText = searchableText
     }
 
     public static func normalize(_ text: String) -> String {
@@ -147,6 +160,7 @@ public struct IndexView {
     public let revision: Int
     public let count: Int
     public let scanning: Bool
+    public let rebuilding: Bool
     public let errorCount: Int
     public let errors: [String]
 }
@@ -182,10 +196,15 @@ public final class FileIndex {
     private var token = ScanToken()
     private let workerURL: URL
     private let timeout: TimeInterval
+    private let database: IndexDatabase?
+    private var pendingEventID: UInt64 = 0
+    private var databaseBuildInProgress = false
+    private var databaseWriteFailed = false
 
-    public init(workerURL: URL? = nil, timeout: TimeInterval = 15) {
+    public init(workerURL: URL? = nil, timeout: TimeInterval = 15, database: IndexDatabase? = nil) {
         self.workerURL = workerURL ?? URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().appendingPathComponent("ScanWorker")
         self.timeout = timeout
+        self.database = database
     }
 
     public func snapshot() -> ScanSnapshot {
@@ -207,21 +226,44 @@ public final class FileIndex {
                 if errors.count == 200 { break }
             }
         }
-        return IndexView(pages: cachedPages, revision: revision, count: count, scanning: scanning,
+        let visibleCount = database?.fileCount ?? count
+        return IndexView(pages: cachedPages, revision: revision, count: visibleCount, scanning: scanning,
+                         rebuilding: databaseBuildInProgress,
                          errorCount: errorCount + (watchFailed ? 1 : 0), errors: errors)
     }
 
     // Entry point for unsandboxed scanner verification. The App uses the
     // authorized overload, carrying only grants explicitly picked by the user.
-    public func start(roots: [URL], watch: Bool = false) {
-        start(authorizedRoots: Self.uniqueRoots(roots).map { ScanRoot(url: $0) }, watch: watch)
+    public func start(roots: [URL], watch: Bool = false, forceRebuild: Bool = false) {
+        start(authorizedRoots: Self.uniqueRoots(roots).map { ScanRoot(url: $0) }, watch: watch,
+              forceRebuild: forceRebuild)
     }
 
-    public func start(authorizedRoots: [ScanRoot], watch: Bool = true) {
+    /// Stops live work without changing the durable database. Authorization
+    /// changes decide separately whether cached metadata must be removed.
+    public func stop() {
+        lock.lock()
+        token.cancel()
+        token = ScanToken()
+        let previousWatcher = watcher
+        watcher = nil
+        roots = []; records = [:]; cachedPages = []; pagesDirty = false
+        count = 0; errorCount = 0; dirty = []; needsRebuild = false
+        scanning = false; watchFailed = false; databaseBuildInProgress = false; databaseWriteFailed = false; revision += 1
+        lock.unlock()
+        withExtendedLifetime(previousWatcher) {}
+    }
+
+    public func start(authorizedRoots: [ScanRoot], watch: Bool = true, forceRebuild: Bool = false) {
         var selected: [ScanRoot] = []
         for root in authorizedRoots.sorted(by: { $0.path.count < $1.path.count }) {
             if !selected.contains(where: { $0.contains(root.path) }) { selected.append(root) }
         }
+        let cacheReady: Bool
+        do { cacheReady = try database?.prepare(roots: selected, forceRebuild: forceRebuild) ?? false }
+        catch { cacheReady = false }
+        let checkpoint = cacheReady ? (database?.checkpoint ?? 0) : 0
+        let currentEventID = FolderEvents.currentEventID
         lock.lock()
         token.cancel()
         let current = ScanToken()
@@ -231,7 +273,10 @@ public final class FileIndex {
         roots = selected
         records = [:]; cachedPages = []; pagesDirty = false; count = 0; errorCount = 0
         dirty = []; needsRebuild = false; watchFailed = false
-        scanning = !selected.isEmpty; revision += 1
+        pendingEventID = cacheReady ? checkpoint : currentEventID
+        databaseBuildInProgress = !selected.isEmpty && !cacheReady
+        databaseWriteFailed = false
+        scanning = databaseBuildInProgress; revision += 1
         lock.unlock()
         withExtendedLifetime(previousWatcher) {}
         guard !selected.isEmpty else { return }
@@ -239,22 +284,26 @@ public final class FileIndex {
         // Start monitoring before scanning so changes during the initial pass
         // are queued and applied after it finishes.
         if watch {
-            let events = FolderEvents { [weak self, current] paths, uncertain in
-                self?.invalidate(paths: paths, uncertain: uncertain, token: current)
+            let events = FolderEvents { [weak self, current] paths, uncertain, eventID in
+                self?.invalidate(paths: paths, uncertain: uncertain, eventID: eventID, token: current)
             }
-            let started = events.start(paths: selected.map(\.path))
+            let since = cacheReady && checkpoint > 0 ? checkpoint : UInt64(kFSEventStreamEventIdSinceNow)
+            let started = events.start(paths: selected.map(\.path), since: since)
             lock.lock()
             if !current.cancelled {
                 if started { watcher = events } else { watchFailed = true; revision += 1 }
             }
             lock.unlock()
         }
-        schedule(selected.map { DirectoryJob(path: $0.path, root: $0, recursive: true) }, token: current, parallelism: 4)
+        if !cacheReady {
+            schedule(selected.map { DirectoryJob(path: $0.path, root: $0, recursive: true) }, token: current, parallelism: 4)
+        }
     }
 
-    private func invalidate(paths: [String], uncertain: Bool, token current: ScanToken) {
+    private func invalidate(paths: [String], uncertain: Bool, eventID: UInt64, token current: ScanToken) {
         lock.lock()
         guard !current.cancelled else { lock.unlock(); return }
+        pendingEventID = max(pendingEventID, eventID)
         if uncertain { needsRebuild = true }
         for path in paths {
             if let root = roots.first(where: { $0.contains(path) }) {
@@ -311,7 +360,15 @@ public final class FileIndex {
                         failed = true
                     }
                     if failed { entries = []; children = []; identities = [:] }
-                    let next = commit(job: job, entries: entries, children: children, identities: identities, errors: errors, token: current)
+                    var databaseChildren: Set<String>?
+                    var databaseFailed = false
+                    if !failed, let database {
+                        do { databaseChildren = try database.replaceDirectory(path: job.path, entries: entries, children: identities) }
+                        catch { errors.append("\(job.path)：\(error.localizedDescription)"); failed = true; databaseFailed = true }
+                    }
+                    let next = commit(job: job, entries: entries, children: children, identities: identities,
+                                      errors: errors, failed: failed, databaseFailed: databaseFailed,
+                                      databaseChildren: databaseChildren, token: current)
                     jobs.complete(children: next)
                 }
             }
@@ -321,18 +378,26 @@ public final class FileIndex {
             guard !current.cancelled else { lock.unlock(); return }
             scanning = false; revision += 1
             let pending = takePending()
+            let checkpoint = pendingEventID
+            let wasBuilding = databaseBuildInProgress
+            let databaseValid = !databaseWriteFailed
+            if pending.isEmpty { databaseBuildInProgress = false }
             lock.unlock()
             if !pending.isEmpty { schedule(pending, token: current, parallelism: 1) }
+            else if databaseValid { try? database?.finishUpdate(checkpoint: checkpoint, complete: wasBuilding) }
+            else { try? database?.invalidateCache() }
         }
     }
 
     private func commit(job: DirectoryJob, entries: [FileEntry], children: Set<String>, identities: [String: DirectoryIdentity],
-                        errors: [String], token current: ScanToken) -> [DirectoryJob] {
-        let pages = stride(from: 0, to: entries.count, by: 1024).map { start in
+                        errors: [String], failed: Bool, databaseFailed: Bool,
+                        databaseChildren: Set<String>?, token current: ScanToken) -> [DirectoryJob] {
+        let pages = database == nil ? stride(from: 0, to: entries.count, by: 1024).map { start in
             SearchPage(entries: Array(entries[start..<min(start + 1024, entries.count)]))
-        }
+        } : []
         lock.lock(); defer { lock.unlock() }
         guard !current.cancelled else { return [] }
+        if databaseFailed { databaseWriteFailed = true }
         let old = records[job.path]
         func remove(_ path: String) {
             if let previous = records.removeValue(forKey: path) {
@@ -345,8 +410,13 @@ public final class FileIndex {
             for path in Array(records.keys) where outdated.contains(path) || prefixes.contains(where: { path.hasPrefix($0) }) { remove(path) }
         }
         remove(job.path)
-        records[job.path] = Record(pages: pages, count: entries.count, children: identities, childPaths: children, errors: errors)
-        count += entries.count; errorCount += errors.count; revision += 1; pagesDirty = true
+        records[job.path] = Record(pages: failed ? [] : pages, count: failed ? 0 : entries.count,
+                                   children: failed ? [:] : identities, childPaths: failed ? [] : children, errors: errors)
+        count += failed ? 0 : entries.count; errorCount += errors.count; revision += 1; pagesDirty = true
+        if failed { return [] }
+        if let databaseChildren {
+            return databaseChildren.sorted().map { DirectoryJob(path: $0, root: job.root, recursive: true) }
+        }
         return children.sorted().filter { job.recursive || old?.childPaths.contains($0) != true || old?.children[$0] != identities[$0] }
             .map { DirectoryJob(path: $0, root: job.root, recursive: true) }
     }

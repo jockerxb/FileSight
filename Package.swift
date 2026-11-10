@@ -6,10 +6,12 @@ let package = Package(
     platforms: [.macOS(.v13)],
     products: [.executable(name: "QianLiYan", targets: ["QianLiYan"])],
     targets: [
-        .target(name: "SearchCore"),
+        .systemLibrary(name: "CSQLite"),
+        .target(name: "SearchCore", dependencies: ["CSQLite"]),
         .executableTarget(name: "ScanWorker", dependencies: ["SearchCore"]),
         .executableTarget(name: "QianLiYan", dependencies: ["SearchCore"]),
         .executableTarget(name: "SearchVerification", dependencies: ["SearchCore"], path: "Tests/SearchVerification"),
-        .executableTarget(name: "QuickSearchVerification", dependencies: ["SearchCore"], path: "Tests/QuickSearchVerification")
+        .executableTarget(name: "QuickSearchVerification", dependencies: ["SearchCore"], path: "Tests/QuickSearchVerification"),
+        .executableTarget(name: "DatabaseVerification", dependencies: ["SearchCore"], path: "Tests/DatabaseVerification")
     ]
 )

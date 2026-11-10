@@ -14,7 +14,9 @@ enum LauncherResult {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTableViewDataSource, NSTableViewDelegate, NSMenuDelegate, NSWindowDelegate {
-    let index = FileIndex()
+    let database: IndexDatabase?
+    let databaseError: String?
+    let index: FileIndex
     let panel = SearchPanel(contentRect: NSRect(x: 0, y: 0, width: 780, height: 210), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
     let field = NSTextField()
     let scope = LauncherDropdown(label: "搜索范围", titles: Scope.allCases.map(\.title))
@@ -63,6 +65,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     var shownRevision = -1
     var lastAutomatic = Date.distantPast
     var lastPanelPresentationMilliseconds: Double = 0
+    var lastDatabaseSearchMilliseconds: Double = 0
+    var lastDatabaseCountMilliseconds: Double = 0
     var panelTransition = 0
     var panelRequestedVisible = false
     var hotkeyEventCount = 0
@@ -72,9 +76,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     let formatter: DateFormatter = {
         let f = DateFormatter(); f.locale = Locale(identifier: "zh_CN"); f.dateFormat = "yyyy/MM/dd HH:mm"; return f
     }()
-    var productTitle: String { "千里眼 \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "2.2")" }
+    var productTitle: String { "千里眼 \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "2.3")" }
     static let orderTitles = ["名称优先", "修改时间", "创建时间", "文件类型", "文件名"]
     var theme = LauncherTheme(rawValue: UserDefaults.standard.integer(forKey: LauncherTheme.preferenceKey)) ?? .dark
+
+    override init() {
+        do {
+            let base = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
+                                                   appropriateFor: nil, create: true)
+                .appendingPathComponent("FileSight", isDirectory: true)
+            let loaded = try IndexDatabase.openRecovering(url: base.appendingPathComponent("metadata.sqlite3"))
+            database = loaded; databaseError = nil; index = FileIndex(database: loaded)
+        } catch {
+            database = nil; databaseError = error.localizedDescription; index = FileIndex()
+        }
+        super.init()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -92,7 +109,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         if hotkey.register(preferred) { activeShortcut = preferred }
         loadApplications()
         if !LoginLaunch.isLoginEvent { showPanel() }
-        rescan()
+        startIndex(forceRebuild: false)
         timer = Timer.scheduledTimer(withTimeInterval: 0.65, repeats: true) { [weak self] _ in self?.pollIndex() }
     }
 
@@ -102,6 +119,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             try replaceDirectoryRoots(restored)
         } catch {
             DirectoryAuthorizationStore.clear()
+            try? database?.clearAll()
             roots = []
         }
         let downloadsPath = FileIndex.canonicalRoot(downloads).path
@@ -116,14 +134,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             nextAccess.forEach { $0.stopAccessingSecurityScopedResource() }
             throw error
         }
-        index.start(authorizedRoots: [])
+        index.stop()
         activeDirectoryAccess.forEach { $0.stopAccessingSecurityScopedResource() }
         activeDirectoryAccess = nextAccess
         roots = nextRoots
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        index.start(authorizedRoots: [])
+        index.stop()
         activeDirectoryAccess.forEach { $0.stopAccessingSecurityScopedResource() }
         activeDirectoryAccess = []
     }
@@ -416,6 +434,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 }
                 return
             }
+            if let database = self.database {
+                do {
+                    let page = try database.search(parsed: parsed, order: sortOrder, ascending: asc,
+                                                   limit: pageLimit, cancellation: cancellation)
+                    guard !cancellation.cancelled, let page else { return }
+                    DispatchQueue.main.async {
+                        self.applyDatabasePage(page, applications: appRows, request: id, generation: generation,
+                                               scanning: view.scanning, key: key)
+                    }
+                    let countStarted = ProcessInfo.processInfo.systemUptime
+                    let total = try database.count(parsed: parsed, cancellation: cancellation)
+                    let countMilliseconds = (ProcessInfo.processInfo.systemUptime - countStarted) * 1000
+                    guard !cancellation.cancelled, let total else { return }
+                    DispatchQueue.main.async {
+                        self.applyDatabaseCount(total, applications: appRows, request: id,
+                                                generation: generation, scanning: view.scanning,
+                                                milliseconds: countMilliseconds)
+                    }
+                } catch {
+                    DispatchQueue.main.async {
+                        guard id == self.requestID, generation == self.scanGeneration else { return }
+                        self.searchBusy = false
+                        self.updateSearchDisplay(message: "本地索引暂时不可用")
+                    }
+                }
+                return
+            }
             let output = QuickSearch.search(pages: view.pages, parsed: parsed, order: sortOrder, ascending: asc,
                                             limit: pageLimit, cancellation: cancellation, timeLimit: 1.8) { [weak self] partial in
                 DispatchQueue.main.async {
@@ -434,6 +479,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                                      generation: generation, scanning: view.scanning, final: true, key: key)
             }
         }
+    }
+
+    func applyDatabasePage(_ output: DatabaseSearchResult, applications appRows: [ApplicationEntry], request id: Int,
+                           generation: Int, scanning: Bool, key: String) {
+        guard id == requestID, generation == scanGeneration, !token.cancelled else { return }
+        searchBusy = false
+        lastDatabaseSearchMilliseconds = output.milliseconds
+        let selected = selectedResult?.path
+        rows = appRows.map(LauncherResult.application) + output.rows.map(LauncherResult.file)
+        totalMatches = output.rows.count + (output.hasMore ? 1 : 0)
+        table.reloadData()
+        let selection = selected.flatMap { path in rows.firstIndex(where: { $0.path == path }) } ?? 0
+        if !rows.isEmpty { table.selectRowIndexes(IndexSet(integer: selection), byExtendingSelection: false) }
+        let appText = appRows.isEmpty ? "" : "\(appRows.count) 个应用"
+        let separator = appText.isEmpty ? "" : " · "
+        let message: String
+        if output.rows.isEmpty {
+            message = appRows.isEmpty ? (scanning ? "索引更新中…" : "没有匹配项") : appText
+        } else {
+            message = appText + separator + "已显示 \(output.rows.count) 个文件 · 正在统计…"
+        }
+        appliedKey = key
+        updateSearchDisplay(message: message)
+    }
+
+    func applyDatabaseCount(_ total: Int, applications appRows: [ApplicationEntry], request id: Int,
+                            generation: Int, scanning: Bool, milliseconds: Double) {
+        guard id == requestID, generation == scanGeneration, !token.cancelled else { return }
+        lastDatabaseCountMilliseconds = milliseconds
+        totalMatches = total
+        let appText = appRows.isEmpty ? "" : "\(appRows.count) 个应用"
+        let separator = appText.isEmpty ? "" : " · "
+        let message: String
+        if total > 0 { message = appText + separator + "\(total.formatted()) 个文件" + (scanning ? " · 索引更新中" : "") }
+        else if !appRows.isEmpty { message = appText + (scanning ? " · 索引更新中" : "") }
+        else { message = scanning ? "索引更新中…" : "没有匹配项" }
+        updateSearchDisplay(message: message)
     }
 
     func applyFileSearch(_ output: QuickSearchResult, applications appRows: [ApplicationEntry], request id: Int,
@@ -497,7 +579,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 self.pollInFlight = false
                 if self.shownRevision != view.revision {
                     self.shownRevision = view.revision
-                    self.status.stringValue = view.scanning ? "索引更新中…" : view.errorCount > 0 ? "部分目录未读取" : ""
+                    self.status.stringValue = view.scanning ? (view.rebuilding ? "建立本地索引…" : "同步文件变化…")
+                        : view.errorCount > 0 ? "部分目录未读取" : ""
                     self.status.isHidden = self.status.stringValue.isEmpty
                 }
                 guard self.panel.isVisible, !self.roots.isEmpty, !self.searchBusy, !self.field.stringValue.isEmpty,
@@ -538,7 +621,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         dialog.canCreateDirectories = false; dialog.allowsMultipleSelection = requested == .custom
         dialog.directoryURL = downloads
         dialog.prompt = "授权只读"
-        dialog.message = "只读搜索你选中的本地目录。授权会保存在本机，索引仍在退出后清除。"
+        dialog.message = "只读搜索你选中的本地目录。授权与文件元数据索引仅保存在本机沙盒。"
         if dialog.runModal() == .OK {
             do {
                 let selected = try dialog.urls.map(ScanRoot.authorized)
@@ -554,15 +637,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         scope.selectItem(at: selectedScope.rawValue)
         presentPanel(eventTime: nil)
     }
-    @objc func rescan() {
+    func startIndex(forceRebuild: Bool) {
         requestID += 1; scanGeneration += 1; token.cancel(); token = SearchCancellation(); pending?.cancel(); searchBusy = false; appliedKey = ""; shownRevision = -1
-        index.start(authorizedRoots: roots)
+        index.start(authorizedRoots: roots, forceRebuild: forceRebuild)
         authorize.isHidden = !roots.isEmpty
         scope.toolTip = roots.isEmpty ? "尚未授权目录" : roots.map(\.path).joined(separator: "；")
         rows = []; table.reloadData()
         if !field.stringValue.isEmpty { requestSearch(resetLimit: true) }
         pollIndex()
     }
+    @objc func rescan() { startIndex(forceRebuild: true) }
     var selectedResult: LauncherResult? { rows.indices.contains(table.selectedRow) ? rows[table.selectedRow] : nil }
     @objc func performSelected() {
         guard let selectedResult else { return }
@@ -631,10 +715,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         dialog.beginSheetModal(for: window) { [weak self] response in
             guard response == .alertFirstButtonReturn, let self else { return }
             DirectoryAuthorizationStore.clear()
+            try? self.database?.clearAll()
             try? self.replaceDirectoryRoots([])
             self.selectedScope = .downloads
             self.scope.selectItem(at: self.selectedScope.rawValue)
-            self.rescan()
+            self.startIndex(forceRebuild: false)
             self.settings?.update(theme: self.theme, shortcut: self.activeShortcut, hasDirectoryAuthorization: false)
         }
     }
@@ -654,11 +739,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         let panelLatency = lastPanelPresentationMilliseconds > 0
             ? " · 窗口准备 \(Int(lastPanelPresentationMilliseconds.rounded())) ms" : ""
         let hotkeyState = " · 快捷键 \(hotkeyEventCount) 次（显示 \(hotkeyShowCount) / 收起 \(hotkeyHideCount)）"
+        let storageState = database.map { " · SQLite \(ByteCountFormatter.string(fromByteCount: $0.storageBytes, countStyle: .file))" }
+            ?? " · 内存降级"
+        let queryTiming = lastDatabaseSearchMilliseconds > 0
+            ? " · 结果 \(Int(lastDatabaseSearchMilliseconds.rounded())) ms / 总数 \(Int(lastDatabaseCountMilliseconds.rounded())) ms" : ""
         if roots.isEmpty {
-            dialog.informativeText = "尚未授权目录。请先从搜索面板选择目录。" + panelLatency + hotkeyState
+            dialog.informativeText = "尚未授权目录。请先从搜索面板选择目录。" + storageState + panelLatency + hotkeyState
         } else {
-            let state = view.scanning ? "正在更新" : view.errorCount > 0 ? "有访问提示" : "索引已就绪"
-            dialog.informativeText = "\(state) · 已收录 \(view.count.formatted()) 项" + panelLatency + hotkeyState
+            let state = view.scanning ? (view.rebuilding ? "正在建库" : "正在同步") : view.errorCount > 0 ? "有访问提示" : "索引已就绪"
+            dialog.informativeText = "\(state) · 已收录 \(view.count.formatted()) 项" + storageState + queryTiming + panelLatency + hotkeyState
         }
         dialog.addButton(withTitle: "完成")
         let canRefresh = !roots.isEmpty && !view.scanning
@@ -667,7 +756,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             let details = NSTextView(frame: NSRect(x: 0, y: 0, width: 395, height: 125))
             details.isEditable = false; details.font = .systemFont(ofSize: 12)
             let issues = view.errorCount > 0 ? "\n\n访问提示（\(view.errorCount) 处）\n" + view.errors.joined(separator: "\n") : ""
-            details.string = "搜索范围\n" + roots.map(\.path).joined(separator: "\n") + issues
+            let storageIssue = databaseError.map { "\n\nSQLite 已降级\n\($0)" } ?? ""
+            details.string = "搜索范围\n" + roots.map(\.path).joined(separator: "\n") + issues + storageIssue
             details.isVerticallyResizable = true; details.autoresizingMask = [.width]
             let scroll = NSScrollView(frame: details.frame)
             scroll.documentView = details; scroll.hasVerticalScroller = true

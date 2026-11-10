@@ -6,3 +6,4 @@ export SWIFTPM_MODULECACHE_OVERRIDE="$PWD/.build/module-cache"
 swift build --disable-sandbox --cache-path .build/cache --product ScanWorker
 swift run --disable-sandbox --cache-path .build/cache SearchVerification
 swift run --disable-sandbox --cache-path .build/cache -c release QuickSearchVerification
+swift run --disable-sandbox --cache-path .build/cache -c release DatabaseVerification

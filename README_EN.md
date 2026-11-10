@@ -22,13 +22,13 @@ Your Downloads folder is full of invoices, spreadsheets, and reference files. Yo
 - **Pinyin and initials:** Find Chinese app and file names using full Pinyin or their initials.
 - **Type and date filters:** For example, `最近1个月 发票 pdf` finds invoice PDFs modified in the last month and shows removable filter chips.
 - **Flexible sorting:** Exact names first, then prefix and substring matches; newest modification first within each tier. You can also sort by modification date, creation date, file type, or filename.
-- **Automatic index updates:** Tracks changes in authorized folders while running, without a daily full-folder scan.
+- **Persistent incremental index:** Loads a sandboxed SQLite metadata index immediately and replays FSEvents changes that occurred while the app was closed.
 - **Responsive by design:** The shortcut paints and focuses the panel before reading index state; broad searches return the best current results instead of waiting indefinitely.
 - **Simple settings:** Light, dark, or system appearance and optional launch at login. Reveal results in Finder or copy their paths.
 
 ## Privacy and file safety
 
-Search reads installed-app names and icons plus file names, paths, timestamps, and other metadata, not document contents. App discovery uses standard local macOS application locations and is independent of the authorized file-search folder. Both the app and its scanner use App Sandbox with no network entitlements and read-only access to authorized folders. The index and queries stay in memory and are not retained after quitting.
+Search reads installed-app names and icons plus file names, paths, timestamps, and other metadata, not document contents. App discovery uses standard local macOS application locations and is independent of the authorized file-search folder. Both the app and its scanner use App Sandbox with no network entitlements and read-only access to authorized folders. File metadata and derived search candidates are stored in a local sandboxed SQLite database; search queries are never retained.
 
 File search defaults to Downloads. Authorize a folder once; its read-only security-scoped bookmark is kept inside the app sandbox and restored on later launches, and can be revoked in Settings. FileSight skips network volumes, does not follow symbolic links, and does not request cloud-file downloads. Clicking the GitHub button explicitly opens the project page in your browser.
 

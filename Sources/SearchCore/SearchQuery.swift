@@ -17,16 +17,19 @@ public enum FileCategory: String, CaseIterable, Hashable {
     }
 
     public func contains(kind: String) -> Bool {
-        let value = kind.lowercased()
+        indexedKinds.contains(kind.lowercased())
+    }
+
+    public var indexedKinds: Set<String> {
         switch self {
-        case .pdf: return value == "pdf"
-        case .word: return ["doc", "docx", "rtf", "pages"].contains(value)
-        case .spreadsheet: return ["xls", "xlsx", "csv", "numbers"].contains(value)
-        case .presentation: return ["ppt", "pptx", "key"].contains(value)
-        case .image: return ["jpg", "jpeg", "png", "gif", "heic", "webp", "tiff", "bmp", "svg"].contains(value)
-        case .video: return ["mp4", "mov", "m4v", "avi", "mkv", "webm"].contains(value)
-        case .audio: return ["mp3", "m4a", "wav", "aac", "flac", "ogg"].contains(value)
-        case .folder: return value == "文件夹"
+        case .pdf: ["pdf"]
+        case .word: ["doc", "docx", "rtf", "pages"]
+        case .spreadsheet: ["xls", "xlsx", "csv", "numbers"]
+        case .presentation: ["ppt", "pptx", "key"]
+        case .image: ["jpg", "jpeg", "png", "gif", "heic", "webp", "tiff", "bmp", "svg"]
+        case .video: ["mp4", "mov", "m4v", "avi", "mkv", "webm"]
+        case .audio: ["mp3", "m4a", "wav", "aac", "flac", "ogg"]
+        case .folder: ["文件夹"]
         }
     }
 }

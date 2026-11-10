@@ -53,7 +53,11 @@ public struct ScanRoot {
         return url
     }
 
-    init(url: URL, bookmark: Data? = nil) {
+    public init(url: URL) {
+        self.init(url: url, bookmark: nil)
+    }
+
+    private init(url: URL, bookmark: Data?) {
         path = FileIndex.canonicalRoot(url).path
         var metadata = stat()
         identity = lstat(path, &metadata) == 0 && metadata.st_mode & S_IFMT == S_IFDIR ? DirectoryIdentity(metadata) : nil
