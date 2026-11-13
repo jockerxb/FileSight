@@ -1,5 +1,7 @@
 [中文](README.md) · **English**
 
+[![Verify](https://github.com/jockerxb/FileSight/actions/workflows/verify.yml/badge.svg)](https://github.com/jockerxb/FileSight/actions/workflows/verify.yml)
+
 [![FileSight: Find your files. Keep them private.](docs/images/filesight-hero-en.png)](https://github.com/jockerxb/FileSight)
 
 # FileSight · 千里眼
@@ -8,7 +10,7 @@
 
 FileSight is a native macOS local search app. Press a shortcut to launch an installed app or find a file in Downloads or a folder you choose. Reveal files in Finder when needed. No accounts, uploads, or online search; no document editing or deletion actions.
 
-[Download v2.1 preview](https://github.com/jockerxb/FileSight/releases/tag/v2.1) · [Detailed guide (中文)](docs/USER_GUIDE.zh-CN.md) · [Source code](https://github.com/jockerxb/FileSight)
+[Download v2.3 preview](https://github.com/jockerxb/FileSight/releases/tag/v2.3) · [Detailed guide (中文)](docs/USER_GUIDE.zh-CN.md) · [Source code](https://github.com/jockerxb/FileSight)
 
 ## When to use FileSight
 
@@ -32,7 +34,7 @@ Search reads installed-app names and icons plus file names, paths, timestamps, a
 
 File search defaults to Downloads. Authorize a folder once; its read-only security-scoped bookmark is kept inside the app sandbox and restored on later launches, and can be revoked in Settings. FileSight skips network volumes, does not follow symbolic links, and does not request cloud-file downloads. Clicking the GitHub button explicitly opens the project page in your browser.
 
-[Privacy design and verification (中文)](PRIVACY.md)
+[Privacy design and verification (中文)](PRIVACY.md) · [Report a security issue privately](SECURITY.md)
 
 ## Install and get started
 

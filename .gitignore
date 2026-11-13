@@ -4,3 +4,4 @@ dist/
 /VERIFICATION.md
 /assets/branding/logo-concept-v1.md
 /assets/branding/qianliyan-logo-concept-v1.png
+/scripts/notarize-app.sh

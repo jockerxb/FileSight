@@ -1,5 +1,7 @@
 **中文** · [English](README_EN.md)
 
+[![Verify](https://github.com/jockerxb/FileSight/actions/workflows/verify.yml/badge.svg)](https://github.com/jockerxb/FileSight/actions/workflows/verify.yml)
+
 [![千里眼 FileSight：文件一搜即见，隐私留在本机](docs/images/filesight-hero-zh.png)](https://github.com/jockerxb/FileSight)
 
 # 千里眼 · FileSight
@@ -8,7 +10,7 @@
 
 千里眼是一款原生 macOS 本地搜索工具。按下快捷键，可以启动本机 App，也可以从下载目录或你选择的文件夹中找到文件，再到 Finder 中定位。没有账号、上传或联网搜索，也不提供修改和删除文档的操作。
 
-[下载 v2.1 预览版](https://github.com/jockerxb/FileSight/releases/tag/v2.1) · [使用指南](docs/USER_GUIDE.zh-CN.md) · [源代码](https://github.com/jockerxb/FileSight)
+[下载 v2.3 预览版](https://github.com/jockerxb/FileSight/releases/tag/v2.3) · [使用指南](docs/USER_GUIDE.zh-CN.md) · [源代码](https://github.com/jockerxb/FileSight)
 
 ## 应用场景
 
@@ -22,7 +24,7 @@
 - **拼音与首字母**：输入完整拼音或首字母，可以搜索中文 App 与中文文件名。
 - **类型与日期筛选**：例如输入 `最近1个月 发票 pdf`，只显示最近一个月修改过的发票 PDF；筛选条件会显示为可移除标签。
 - **排序可选**：默认完整名称优先，其次开头匹配、包含匹配，同级最近修改优先；也可按修改时间、创建时间、文件类型、文件名排序。
-- **自动更新索引**：运行期间跟踪授权目录的文件变化，无需每天重新扫描整个目录。
+- **持久化增量索引**：启动时直接加载沙盒内 SQLite 元数据索引，并通过 FSEvents 补齐 App 退出期间的变化。
 - **及时响应**：快捷键先显示搜索面板，索引状态在后台更新；范围过大时显示当前最佳结果，不无限等待。
 - **轻量设置**：普通、暗夜或跟随系统外观，支持登录时启动；回车定位 Finder，也可复制路径。
 
@@ -32,7 +34,7 @@
 
 文件搜索默认为“下载”，首次需选择目录授权；同一目录的只读凭证保存在 App 沙盒内，后续启动自动恢复，可在设置中取消。不扫描网络卷，不跟随符号链接，也不主动下载云端文件。GitHub 按钮仅由用户主动点击后交给浏览器打开项目页。
 
-[查看隐私设计与验证说明](PRIVACY.md)
+[查看隐私设计与验证说明](PRIVACY.md) · [私下报告安全问题](SECURITY.md)
 
 ## 安装与开始使用
 
