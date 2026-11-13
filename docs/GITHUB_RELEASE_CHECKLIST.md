@@ -5,7 +5,9 @@
 - [x] `main` 包含 FileSight 2.3（build 30）源码
 - [x] 中英文 README 功能、隐私边界与版本保持一致
 - [x] GitHub Actions 自动执行搜索、SQLite/FSEvents、沙盒隐私与打包验证
+- [x] `main` 要求通过 CI，禁止 force push 与删除
 - [x] Secret scanning 与 push protection 已开启
+- [x] GitHub Topics 已补充 macOS、Swift、本地搜索与隐私标签
 - [x] Issue 模板提醒用户移除个人文件名和路径
 - [x] `SECURITY.md` 与 Private Vulnerability Reporting 已配置
 - [ ] 确定代码授权方式并增加 `LICENSE`
