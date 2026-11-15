@@ -72,6 +72,10 @@ Outputs: `dist/千里眼.app` and `dist/FileSight.zip`. Building checks signatur
 
 </details>
 
+## License
+
+FileSight is available under the [MIT License](LICENSE). You may use, modify, and distribute the source while retaining the original copyright and license notice.
+
 ## Support and feedback
 
 [Open an issue](https://github.com/jockerxb/FileSight/issues) with your macOS version and reproduction steps. Use sample filenames instead of personal document information.

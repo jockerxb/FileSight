@@ -72,6 +72,10 @@ python3 scripts/verify-privacy.py
 
 </details>
 
+## 开源许可
+
+本项目采用 [MIT License](LICENSE)。你可以使用、修改和分发源码，但须保留原始版权与许可声明。
+
 ## 支持与反馈
 
 欢迎 [提交 Issue](https://github.com/jockerxb/FileSight/issues)，附上 macOS 版本和复现步骤；请用示例文件名代替个人文档信息。
