@@ -10,7 +10,7 @@
 - [x] GitHub Topics 已补充 macOS、Swift、本地搜索与隐私标签
 - [x] Issue 模板提醒用户移除个人文件名和路径
 - [x] `SECURITY.md` 与 Private Vulnerability Reporting 已配置
-- [ ] 确定代码授权方式并增加 `LICENSE`
+- [x] 采用 MIT License，明确允许使用、修改与分发源码
 
 ## v2.3 预览版
 
