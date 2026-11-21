@@ -76,7 +76,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     let formatter: DateFormatter = {
         let f = DateFormatter(); f.locale = Locale(identifier: "zh_CN"); f.dateFormat = "yyyy/MM/dd HH:mm"; return f
     }()
-    var productTitle: String { "千里眼 \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "2.3")" }
+    var productTitle: String { "千里眼 \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "2.3.1")" }
     static let orderTitles = ["名称优先", "修改时间", "创建时间", "文件类型", "文件名"]
     var theme = LauncherTheme(rawValue: UserDefaults.standard.integer(forKey: LauncherTheme.preferenceKey)) ?? .dark
 
@@ -381,7 +381,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         }
         let parsed = ParsedSearchQuery.parse(trimmed)
         updateFilterChips(parsed)
-        visibleApplications = ApplicationCatalog.search(applications, query: parsed.text)
+        visibleApplications = ApplicationCatalog.search(applications, query: parsed.applicationText)
         rows = visibleApplications.map(LauncherResult.application)
         totalMatches = 0
         table.reloadData()

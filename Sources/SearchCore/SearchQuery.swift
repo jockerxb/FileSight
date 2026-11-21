@@ -60,6 +60,10 @@ public struct ParsedSearchQuery {
     public let withoutDate: String
 
     public var hasFilters: Bool { !categories.isEmpty || date != nil }
+    /// App names are searched independently from file-type filters. Keep type
+    /// words such as "keynote" or "pdf", while removing date expressions that
+    /// cannot be part of an application name.
+    public var applicationText: String { withoutDate }
     public var categoryTitle: String {
         FileCategory.allCases.filter(categories.contains).map(\.title).joined(separator: "、")
     }
