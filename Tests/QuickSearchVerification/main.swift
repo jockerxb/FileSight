@@ -56,14 +56,25 @@ try require(filtered.rows == [recent] && filtered.total == 1, "日期与 PDF 联
 let literal = ParsedSearchQuery.parse("发票pdf", now: now, calendar: utc)
 try require(literal.text == "发票pdf" && !literal.hasFilters, "没有空格的类型词被误判为筛选条件")
 let typeOnly = ParsedSearchQuery.parse("pdf", now: now, calendar: utc)
-try require(typeOnly.applicationText == "pdf", "PDF 类型词被错误从 App 搜索中移除")
+try require(typeOnly.applicationQueries == ["pdf"], "PDF 类型词被错误从 App 搜索中移除")
 try require(QuickSearch.search(pages: [SearchPage(entries: [recent, old, sheet])], parsed: typeOnly,
                               order: .modified, ascending: false, limit: 100)!.total == 2, "仅输入类型时没有列出全部 PDF")
 let keynote = ParsedSearchQuery.parse("keynote", now: now, calendar: utc)
-try require(keynote.text.isEmpty && keynote.categories == [.presentation] && keynote.applicationText == "keynote",
+try require(keynote.text.isEmpty && keynote.categories == [.presentation] && keynote.applicationQueries == ["keynote"],
             "Keynote 被识别为文件类型后没有保留给 App 搜索")
 let recentKeynote = ParsedSearchQuery.parse("最近1个月 keynote", now: now, calendar: utc)
-try require(recentKeynote.applicationText == "keynote", "日期筛选词没有从 App 搜索中单独移除")
+try require(recentKeynote.applicationQueries == ["最近1个月 keynote", "keynote"], "App 搜索没有同时保留原词与去日期候选")
+let appFixtures = [
+    ApplicationSearchEntry(name: "Keynote", path: "/Applications/Keynote.app",
+                           searchableText: "keynote 讲演", searchableAliases: ["keynote", "讲演"]),
+    ApplicationSearchEntry(name: "本月", path: "/Applications/ThisMonth.app",
+                           searchableText: "本月", searchableAliases: ["本月"])
+]
+try require(ApplicationSearch.search(appFixtures, queries: recentKeynote.applicationQueries).first?.name == "Keynote",
+            "类型+日期筛选时 Keynote 没有优先出现")
+let literalDateApp = ParsedSearchQuery.parse("本月", now: now, calendar: utc)
+try require(ApplicationSearch.search(appFixtures, queries: literalDateApp.applicationQueries).first?.name == "本月",
+            "名称像日期的 App 被文件筛选语义隐藏")
 let createdThisMonth = ParsedSearchQuery.parse("创建于本月 发票", now: now, calendar: utc)
 try require(createdThisMonth.date?.basis == .created &&
             QuickSearch.search(pages: [SearchPage(entries: [recent, old, sheet])], parsed: createdThisMonth,

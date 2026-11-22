@@ -186,6 +186,7 @@ public final class FileIndex {
     private var pagesDirty = false
     private var count = 0
     private var errorCount = 0
+    private var durableErrors: [String: [String]] = [:]
     private var revision = 0
     private var scanning = false
     private var watchFailed = false
@@ -220,7 +221,17 @@ public final class FileIndex {
             pagesDirty = false
         }
         var errors = watchFailed ? ["无法监听目录变化；可手动刷新索引。"] : []
-        if errorCount > 0 {
+        var combinedDurableErrors = durableErrors
+        if database != nil {
+            for (path, record) in records where !record.errors.isEmpty { combinedDurableErrors[path] = record.errors }
+        }
+        let durableCount = combinedDurableErrors.values.reduce(0) { $0 + $1.count }
+        if database != nil {
+            for messages in combinedDurableErrors.values where !messages.isEmpty {
+                errors.append(contentsOf: messages.prefix(200 - errors.count))
+                if errors.count == 200 { break }
+            }
+        } else if errorCount > 0 {
             for record in records.values where !record.errors.isEmpty {
                 errors.append(contentsOf: record.errors.prefix(200 - errors.count))
                 if errors.count == 200 { break }
@@ -229,7 +240,7 @@ public final class FileIndex {
         let visibleCount = database?.fileCount ?? count
         return IndexView(pages: cachedPages, revision: revision, count: visibleCount, scanning: scanning,
                          rebuilding: databaseBuildInProgress,
-                         errorCount: errorCount + (watchFailed ? 1 : 0), errors: errors)
+                         errorCount: (database == nil ? errorCount : durableCount) + (watchFailed ? 1 : 0), errors: errors)
     }
 
     // Entry point for unsandboxed scanner verification. The App uses the
@@ -248,7 +259,7 @@ public final class FileIndex {
         let previousWatcher = watcher
         watcher = nil
         roots = []; records = [:]; cachedPages = []; pagesDirty = false
-        count = 0; errorCount = 0; dirty = []; needsRebuild = false
+        count = 0; errorCount = 0; durableErrors = [:]; dirty = []; needsRebuild = false
         scanning = false; watchFailed = false; databaseBuildInProgress = false; databaseWriteFailed = false; revision += 1
         lock.unlock()
         withExtendedLifetime(previousWatcher) {}
@@ -262,6 +273,9 @@ public final class FileIndex {
         let cacheReady: Bool
         do { cacheReady = try database?.prepare(roots: selected, forceRebuild: forceRebuild) ?? false }
         catch { cacheReady = false }
+        let restoredErrors: [String: [String]]
+        if cacheReady, let database { restoredErrors = (try? database.scanErrors()) ?? [:] }
+        else { restoredErrors = [:] }
         let checkpoint = cacheReady ? (database?.checkpoint ?? 0) : 0
         let currentEventID = FolderEvents.currentEventID
         lock.lock()
@@ -271,7 +285,7 @@ public final class FileIndex {
         let previousWatcher = watcher
         watcher = nil
         roots = selected
-        records = [:]; cachedPages = []; pagesDirty = false; count = 0; errorCount = 0
+        records = [:]; cachedPages = []; pagesDirty = false; count = 0; errorCount = 0; durableErrors = restoredErrors
         dirty = []; needsRebuild = false; watchFailed = false
         pendingEventID = cacheReady ? checkpoint : currentEventID
         databaseBuildInProgress = !selected.isEmpty && !cacheReady
@@ -362,9 +376,13 @@ public final class FileIndex {
                     if failed { entries = []; children = []; identities = [:] }
                     var databaseChildren: Set<String>?
                     var databaseFailed = false
-                    if !failed, let database {
-                        do { databaseChildren = try database.replaceDirectory(path: job.path, entries: entries, children: identities) }
-                        catch { errors.append("\(job.path)：\(error.localizedDescription)"); failed = true; databaseFailed = true }
+                    if let database {
+                        do {
+                            if failed { try database.replaceScanErrors(path: job.path, errors: errors) }
+                            else { databaseChildren = try database.replaceDirectory(path: job.path, entries: entries, children: identities, errors: errors) }
+                        } catch {
+                            errors.append("\(job.path)：\(error.localizedDescription)"); failed = true; databaseFailed = true
+                        }
                     }
                     let next = commit(job: job, entries: entries, children: children, identities: identities,
                                       errors: errors, failed: failed, databaseFailed: databaseFailed,
@@ -374,8 +392,12 @@ public final class FileIndex {
             }
         }
         group.notify(queue: .global(qos: .utility)) { [self] in
+            let refreshedErrors: [String: [String]]?
+            if let database, !current.cancelled { refreshedErrors = try? database.scanErrors() }
+            else { refreshedErrors = nil }
             lock.lock()
             guard !current.cancelled else { lock.unlock(); return }
+            if let refreshedErrors { durableErrors = refreshedErrors }
             scanning = false; revision += 1
             let pending = takePending()
             let checkpoint = pendingEventID
@@ -398,6 +420,7 @@ public final class FileIndex {
         lock.lock(); defer { lock.unlock() }
         guard !current.cancelled else { return [] }
         if databaseFailed { databaseWriteFailed = true }
+        if database != nil, !databaseFailed { durableErrors[job.path] = errors }
         let old = records[job.path]
         func remove(_ path: String) {
             if let previous = records.removeValue(forKey: path) {
