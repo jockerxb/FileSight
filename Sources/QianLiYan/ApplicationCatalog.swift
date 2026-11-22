@@ -1,13 +1,7 @@
 import AppKit
 import SearchCore
 
-struct ApplicationEntry {
-    let name: String
-    let path: String
-    let searchableName: String
-    let searchableText: String
-    let searchableAliases: [String]
-}
+typealias ApplicationEntry = ApplicationSearchEntry
 
 enum ApplicationCatalog {
     static func load() -> [ApplicationEntry] {
@@ -59,7 +53,6 @@ enum ApplicationCatalog {
                     }
                 }
                 entries.append(ApplicationEntry(name: name, path: url.path,
-                                                searchableName: FileEntry.normalize(name),
                                                 searchableText: searchableAliases.joined(separator: " "),
                                                 searchableAliases: searchableAliases))
             }
@@ -129,21 +122,7 @@ enum ApplicationCatalog {
         return keys.filter { seen.insert($0).inserted }
     }
 
-    static func search(_ entries: [ApplicationEntry], query: String, limit: Int = 5) -> [ApplicationEntry] {
-        let needle = FileEntry.normalize(query.trimmingCharacters(in: .whitespacesAndNewlines))
-        guard !needle.isEmpty else { return [] }
-        let words = needle.split(whereSeparator: \.isWhitespace).map(String.init)
-        return entries.compactMap { entry -> (ApplicationEntry, Int)? in
-            guard words.allSatisfy({ entry.searchableText.contains($0) }) else { return nil }
-            let rank: Int
-            if entry.searchableAliases.contains(needle) { rank = 0 }
-            else if entry.searchableAliases.contains(where: { $0.hasPrefix(needle) }) { rank = 1 }
-            else if entry.searchableAliases.contains(where: { $0.contains(needle) }) { rank = 2 }
-            else { rank = 3 }
-            return (entry, rank)
-        }.sorted {
-            if $0.1 != $1.1 { return $0.1 < $1.1 }
-            return $0.0.name.localizedStandardCompare($1.0.name) == .orderedAscending
-        }.prefix(limit).map(\.0)
+    static func search(_ entries: [ApplicationEntry], queries: [String], limit: Int = 5) -> [ApplicationEntry] {
+        ApplicationSearch.search(entries, queries: queries, limit: limit)
     }
 }

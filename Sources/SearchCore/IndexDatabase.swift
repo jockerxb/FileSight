@@ -11,9 +11,14 @@ public struct DatabaseSearchResult {
 }
 
 public enum IndexDatabaseError: LocalizedError {
-    case sqlite(String)
+    case sqlite(code: Int32, message: String)
     public var errorDescription: String? {
-        switch self { case .sqlite(let message): "本地索引错误：\(message)" }
+        switch self { case .sqlite(_, let message): "本地索引错误：\(message)" }
+    }
+    var isCorruption: Bool {
+        switch self {
+        case .sqlite(let code, _): return code == SQLITE_CORRUPT || code == SQLITE_NOTADB
+        }
     }
 }
 
@@ -22,7 +27,9 @@ public final class IndexDatabase {
     private enum Bind { case text(String), double(Double), int(Int64) }
     private static let schemaVersion = 3
     private let lock = NSLock()
+    private let readLock = NSLock()
     private var handle: OpaquePointer?
+    private var readHandle: OpaquePointer?
     private var cachedStatements: [String: OpaquePointer] = [:]
     private var storedCount = 0
     public let url: URL
@@ -36,7 +43,7 @@ public final class IndexDatabase {
         guard sqlite3_open_v2(url.path, &database, flags, nil) == SQLITE_OK, let database else {
             let message = database.map { String(cString: sqlite3_errmsg($0)) } ?? "无法创建数据库"
             if let database { sqlite3_close(database) }
-            throw IndexDatabaseError.sqlite(message)
+            throw IndexDatabaseError.sqlite(code: database.map(sqlite3_extended_errcode) ?? SQLITE_CANTOPEN, message: message)
         }
         handle = database
         do {
@@ -50,7 +57,7 @@ public final class IndexDatabase {
                 case .orderedSame: return 0
                 }
             }, nil)
-            guard collation == SQLITE_OK else { throw IndexDatabaseError.sqlite("无法注册文件名排序规则") }
+            guard collation == SQLITE_OK else { throw IndexDatabaseError.sqlite(code: collation, message: "无法注册文件名排序规则") }
             try execute("PRAGMA journal_mode=WAL")
             try execute("PRAGMA synchronous=NORMAL")
             try execute("PRAGMA foreign_keys=ON")
@@ -58,8 +65,10 @@ public final class IndexDatabase {
             try execute("PRAGMA busy_timeout=2000")
             try ensureSchema()
             storedCount = try scalarInt("SELECT COUNT(*) FROM files")
+            readHandle = try Self.openReadConnection(url: url)
             Self.protectFiles(at: url)
         } catch {
+            if let readHandle { sqlite3_close(readHandle); self.readHandle = nil }
             sqlite3_close(database); handle = nil
             throw error
         }
@@ -67,15 +76,17 @@ public final class IndexDatabase {
 
     deinit {
         for statement in cachedStatements.values { sqlite3_finalize(statement) }
+        if let readHandle { sqlite3_close(readHandle) }
         if let handle { sqlite3_close(handle) }
     }
 
     public static func openRecovering(url: URL) throws -> IndexDatabase {
         do { return try IndexDatabase(url: url) }
-        catch {
+        catch let error as IndexDatabaseError where error.isCorruption {
             for path in [url.path, url.path + "-wal", url.path + "-shm"] { try? FileManager.default.removeItem(atPath: path) }
             return try IndexDatabase(url: url)
         }
+        catch { throw error }
     }
     public var fileCount: Int { lock.lock(); defer { lock.unlock() }; return storedCount }
     public var storageBytes: Int64 {
@@ -142,40 +153,75 @@ public final class IndexDatabase {
         storedCount = 0
     }
 
-    /// Replaces one directory listing and atomically removes vanished subtrees.
-    func replaceDirectory(path: String, entries: [FileEntry], children: [String: DirectoryIdentity]) throws -> Set<String> {
+    /// Diffs one directory listing. Unchanged rows keep their FTS and short-token
+    /// records, so a filesystem event cannot stall readers by rebuilding a
+    /// whole large directory.
+    package func replaceDirectory(path: String, entries: [FileEntry], children: [String: DirectoryIdentity],
+                                  errors: [String] = []) throws -> Set<String> {
         lock.lock(); defer { lock.unlock() }
         var previous: [String: String] = [:]
         try rows("SELECT path,device,inode FROM directories WHERE parent=?", [.text(path)]) { statement in
             previous[columnText(statement, 0)] = "\(sqlite3_column_int64(statement, 1)):\(columnText(statement, 2))"
         }
-        let vanished = previous.compactMap { child, inode in
+        let removedOrReplaced = previous.compactMap { child, inode in
             children[child].map { "\($0.device):\($0.inode)" } == inode ? nil : child
         }
         let changed = Set(children.compactMap { child, identity in
             previous[child] == "\(identity.device):\(identity.inode)" ? nil : child
         })
-        var removed = 0
+        var removed = 0, added = 0
         try transaction {
-            for child in vanished { removed += try deleteSubtree(child) }
-            try run("DELETE FROM files WHERE scan_dir=?", [.text(path)])
-            removed += Int(sqlite3_changes(handle))
-            try run("DELETE FROM directories WHERE parent=?", [.text(path)])
-            for (child, identity) in children {
-                try run("INSERT INTO directories(path,parent,device,inode) VALUES(?,?,?,?)",
+            for child in removedOrReplaced { removed += try deleteSubtree(child) }
+            for (child, identity) in children where changed.contains(child) {
+                try run("INSERT OR REPLACE INTO directories(path,parent,device,inode) VALUES(?,?,?,?)",
                         [.text(child), .text(path), .int(Int64(identity.device)), .text(String(identity.inode))])
             }
-            for entry in entries { try insert(entry, scanDirectory: path) }
+            var existing: [String: StoredFile] = [:]
+            try rows("SELECT id,path,name_norm,phonetic,search_text,kind,modified,created FROM files WHERE scan_dir=?", [.text(path)]) { statement in
+                let item = StoredFile(id: sqlite3_column_int64(statement, 0), path: columnText(statement, 1),
+                                      name: columnText(statement, 2), phonetic: columnText(statement, 3),
+                                      searchText: columnText(statement, 4), kind: columnText(statement, 5),
+                                      modified: sqlite3_column_double(statement, 6), created: sqlite3_column_double(statement, 7))
+                existing[item.path] = item
+            }
+            var incoming: [String: FileEntry] = [:]
+            for entry in entries { incoming[entry.path] = entry }
+            for (oldPath, old) in existing where incoming[oldPath] == nil {
+                try run("DELETE FROM files WHERE id=?", [.int(old.id)]); removed += 1
+            }
+            for entry in incoming.values {
+                if let old = existing[entry.path] {
+                    if !old.matches(entry) { try update(entry, id: old.id, scanDirectory: path) }
+                } else {
+                    try insert(entry, scanDirectory: path); added += 1
+                }
+            }
+            try replaceScanErrorsLocked(path: path, errors: errors)
         }
-        storedCount += entries.count - removed
+        storedCount += added - removed
         Self.protectFiles(at: url)
         return changed
+    }
+
+    public func replaceScanErrors(path: String, errors: [String]) throws {
+        lock.lock(); defer { lock.unlock() }
+        try transaction { try replaceScanErrorsLocked(path: path, errors: errors) }
+    }
+
+    public func scanErrors() throws -> [String: [String]] {
+        lock.lock(); defer { lock.unlock() }
+        var result: [String: [String]] = [:]
+        try rows("SELECT scan_dir,message FROM scan_errors ORDER BY scan_dir,ordinal") { statement in
+            result[columnText(statement, 0), default: []].append(columnText(statement, 1))
+        }
+        return result
     }
 
     public func search(parsed: ParsedSearchQuery, order: SearchOrder, ascending: Bool, limit: Int,
                        cancellation: SearchCancellation = SearchCancellation()) throws -> DatabaseSearchResult? {
         let started = ProcessInfo.processInfo.systemUptime
-        lock.lock(); defer { lock.unlock() }
+        readLock.lock(); defer { readLock.unlock() }
+        guard let readHandle else { throw IndexDatabaseError.sqlite(code: SQLITE_MISUSE, message: "读取连接未就绪") }
         guard !cancellation.cancelled else { return nil }
         let plan = queryPlan(parsed: parsed)
         var binds = plan.binds
@@ -184,8 +230,8 @@ public final class IndexDatabase {
         let sql = plan.prefix + "SELECT f.path,f.modified,f.created,f.kind,f.name_norm,f.phonetic,f.search_text " +
             plan.from + plan.whereSQL + orderSQL + " LIMIT ?"
         var found: [FileEntry] = []
-        try withCancellation(cancellation) {
-            try rows(sql, binds) { statement in
+        try withCancellation(cancellation, on: readHandle) {
+            try rows(sql, binds, on: readHandle) { statement in
                 found.append(FileEntry(path: columnText(statement, 0),
                                        modified: Date(timeIntervalSince1970: sqlite3_column_double(statement, 1)),
                                        created: Date(timeIntervalSince1970: sqlite3_column_double(statement, 2)),
@@ -201,12 +247,13 @@ public final class IndexDatabase {
     }
 
     public func count(parsed: ParsedSearchQuery, cancellation: SearchCancellation = SearchCancellation()) throws -> Int? {
-        lock.lock(); defer { lock.unlock() }
+        readLock.lock(); defer { readLock.unlock() }
+        guard let readHandle else { throw IndexDatabaseError.sqlite(code: SQLITE_MISUSE, message: "读取连接未就绪") }
         guard !cancellation.cancelled else { return nil }
         let plan = queryPlan(parsed: parsed)
         var value = 0
-        try withCancellation(cancellation) {
-            value = try scalarInt(plan.prefix + "SELECT COUNT(*) " + plan.from + plan.whereSQL, plan.binds)
+        try withCancellation(cancellation, on: readHandle) {
+            value = try scalarInt(plan.prefix + "SELECT COUNT(*) " + plan.from + plan.whereSQL, plan.binds, on: readHandle)
         }
         return cancellation.cancelled ? nil : value
     }
@@ -265,9 +312,46 @@ public final class IndexDatabase {
                 [.text(entry.path), .text(scanDirectory), .text(entry.name), .text(entry.searchableName),
                  .text(stem), .text(entry.searchablePhonetic), .text(entry.searchableText), .text(entry.kind),
                  .double(entry.modified.timeIntervalSince1970), .double(entry.created.timeIntervalSince1970)])
-        let identifier = sqlite3_last_insert_rowid(handle)
+        try insertTokens(for: entry, identifier: sqlite3_last_insert_rowid(handle))
+    }
+
+    private struct StoredFile {
+        let id: Int64
+        let path: String
+        let name: String
+        let phonetic: String
+        let searchText: String
+        let kind: String
+        let modified: Double
+        let created: Double
+
+        func matches(_ entry: FileEntry) -> Bool {
+            name == entry.searchableName && phonetic == entry.searchablePhonetic && searchText == entry.searchableText &&
+                kind == entry.kind && modified == entry.modified.timeIntervalSince1970 && created == entry.created.timeIntervalSince1970
+        }
+    }
+
+    private func update(_ entry: FileEntry, id: Int64, scanDirectory: String) throws {
+        let stem = FileEntry.normalize((entry.name as NSString).deletingPathExtension)
+        try run("UPDATE files SET path=?,scan_dir=?,name=?,name_norm=?,stem_norm=?,phonetic=?,search_text=?,kind=?,modified=?,created=? WHERE id=?",
+                [.text(entry.path), .text(scanDirectory), .text(entry.name), .text(entry.searchableName), .text(stem),
+                 .text(entry.searchablePhonetic), .text(entry.searchableText), .text(entry.kind),
+                 .double(entry.modified.timeIntervalSince1970), .double(entry.created.timeIntervalSince1970), .int(id)])
+        try run("DELETE FROM short_tokens WHERE file_id=?", [.int(id)])
+        try insertTokens(for: entry, identifier: id)
+    }
+
+    private func insertTokens(for entry: FileEntry, identifier: Int64) throws {
         for token in Self.shortTokens(entry.searchableText) {
             try run("INSERT OR IGNORE INTO short_tokens(token,file_id) VALUES(?,?)", [.text(token), .int(identifier)])
+        }
+    }
+
+    private func replaceScanErrorsLocked(path: String, errors: [String]) throws {
+        try run("DELETE FROM scan_errors WHERE scan_dir=?", [.text(path)])
+        for (ordinal, message) in errors.prefix(200).enumerated() {
+            try run("INSERT INTO scan_errors(scan_dir,ordinal,message) VALUES(?,?,?)",
+                    [.text(path), .int(Int64(ordinal)), .text(message)])
         }
     }
 
@@ -288,19 +372,23 @@ public final class IndexDatabase {
         try run("DELETE FROM files WHERE path=? OR path LIKE ? ESCAPE '\\'", [.text(path), .text(prefix)])
         let removed = Int(sqlite3_changes(handle))
         try run("DELETE FROM directories WHERE path=? OR path LIKE ? ESCAPE '\\'", [.text(path), .text(prefix)])
+        try run("DELETE FROM scan_errors WHERE scan_dir=? OR scan_dir LIKE ? ESCAPE '\\'", [.text(path), .text(prefix)])
         return removed
     }
 
     private func ensureSchema() throws {
         let version = try scalarInt("PRAGMA user_version")
         if version != Self.schemaVersion {
-            try execute("DROP TABLE IF EXISTS short_tokens; DROP TABLE IF EXISTS file_fts; DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS directories; DROP TABLE IF EXISTS roots; DROP TABLE IF EXISTS meta")
+            try execute("DROP TABLE IF EXISTS short_tokens; DROP TABLE IF EXISTS file_fts; DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS directories; DROP TABLE IF EXISTS scan_errors; DROP TABLE IF EXISTS roots; DROP TABLE IF EXISTS meta")
         }
         try execute("""
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS roots(path TEXT PRIMARY KEY,device INTEGER NOT NULL,inode TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS directories(path TEXT PRIMARY KEY,parent TEXT NOT NULL,device INTEGER NOT NULL,inode TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS directories_parent ON directories(parent);
+            CREATE TABLE IF NOT EXISTS scan_errors(
+              scan_dir TEXT NOT NULL,ordinal INTEGER NOT NULL,message TEXT NOT NULL,
+              PRIMARY KEY(scan_dir,ordinal));
             CREATE TABLE IF NOT EXISTS files(
               id INTEGER PRIMARY KEY,path TEXT NOT NULL UNIQUE,scan_dir TEXT NOT NULL,name TEXT NOT NULL,
               name_norm TEXT NOT NULL,stem_norm TEXT NOT NULL,phonetic TEXT NOT NULL,search_text TEXT NOT NULL,kind TEXT NOT NULL,
@@ -331,7 +419,7 @@ public final class IndexDatabase {
     }
 
     private func clearDataLocked() throws {
-        try execute("DELETE FROM short_tokens; DELETE FROM files; DELETE FROM directories; DELETE FROM roots")
+        try execute("DELETE FROM short_tokens; DELETE FROM files; DELETE FROM directories; DELETE FROM scan_errors; DELETE FROM roots")
         try setMeta("complete", "0"); try setMeta("checkpoint", "0")
     }
 
@@ -350,24 +438,29 @@ public final class IndexDatabase {
         catch { try? execute("ROLLBACK"); throw error }
     }
 
-    private func withCancellation<T>(_ cancellation: SearchCancellation, _ body: () throws -> T) throws -> T {
-        sqlite3_progress_handler(handle, 1000, { context in
+    private func withCancellation<T>(_ cancellation: SearchCancellation, on database: OpaquePointer,
+                                     _ body: () throws -> T) throws -> T {
+        sqlite3_progress_handler(database, 1000, { context in
             guard let context else { return 0 }
             return Unmanaged<SearchCancellation>.fromOpaque(context).takeUnretainedValue().cancelled ? 1 : 0
         }, Unmanaged.passUnretained(cancellation).toOpaque())
-        defer { sqlite3_progress_handler(handle, 0, nil, nil) }
+        defer { sqlite3_progress_handler(database, 0, nil, nil) }
         return try body()
     }
 
-    private func scalarInt(_ sql: String, _ binds: [Bind] = []) throws -> Int {
+    private func scalarInt(_ sql: String, _ binds: [Bind] = [], on database: OpaquePointer? = nil) throws -> Int {
         var result = 0
-        try rows(sql, binds) { result = Int(sqlite3_column_int64($0, 0)) }
+        try rows(sql, binds, on: database) { result = Int(sqlite3_column_int64($0, 0)) }
         return result
     }
 
-    private func rows(_ sql: String, _ binds: [Bind] = [], row: (OpaquePointer) throws -> Void) throws {
+    private func rows(_ sql: String, _ binds: [Bind] = [], on supplied: OpaquePointer? = nil,
+                      row: (OpaquePointer) throws -> Void) throws {
+        guard let database = supplied ?? handle else {
+            throw IndexDatabaseError.sqlite(code: SQLITE_MISUSE, message: "数据库连接未就绪")
+        }
         var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK, let statement else { throw failure() }
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK, let statement else { throw failure(on: database) }
         defer { sqlite3_finalize(statement) }
         try bind(binds, to: statement)
         while true {
@@ -375,7 +468,7 @@ public final class IndexDatabase {
             if code == SQLITE_ROW { try row(statement) }
             else if code == SQLITE_DONE { return }
             else if code == SQLITE_INTERRUPT { return }
-            else { throw failure() }
+            else { throw failure(on: database) }
         }
     }
 
@@ -411,11 +504,15 @@ public final class IndexDatabase {
         let code = sqlite3_exec(handle, sql, nil, nil, &message)
         guard code == SQLITE_OK else {
             let text = message.map { String(cString: $0) } ?? String(cString: sqlite3_errmsg(handle))
-            sqlite3_free(message); throw IndexDatabaseError.sqlite(text)
+            sqlite3_free(message); throw IndexDatabaseError.sqlite(code: sqlite3_extended_errcode(handle), message: text)
         }
     }
 
-    private func failure() -> IndexDatabaseError { .sqlite(String(cString: sqlite3_errmsg(handle))) }
+    private func failure(on supplied: OpaquePointer? = nil) -> IndexDatabaseError {
+        let database = supplied ?? handle
+        return .sqlite(code: database.map(sqlite3_extended_errcode) ?? SQLITE_MISUSE,
+                       message: database.map { String(cString: sqlite3_errmsg($0)) } ?? "数据库连接未就绪")
+    }
     private func columnText(_ statement: OpaquePointer, _ index: Int32) -> String {
         sqlite3_column_text(statement, index).map { String(cString: $0) } ?? ""
     }
@@ -426,6 +523,39 @@ public final class IndexDatabase {
     private static func protectFiles(at url: URL) {
         for path in [url.path, url.path + "-wal", url.path + "-shm"] where FileManager.default.fileExists(atPath: path) {
             _ = chmod(path, S_IRUSR | S_IWUSR)
+        }
+    }
+
+    private static func openReadConnection(url: URL) throws -> OpaquePointer {
+        var database: OpaquePointer?
+        let flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX
+        guard sqlite3_open_v2(url.path, &database, flags, nil) == SQLITE_OK, let database else {
+            let code = database.map(sqlite3_extended_errcode) ?? SQLITE_CANTOPEN
+            let message = database.map { String(cString: sqlite3_errmsg($0)) } ?? "无法打开索引读取连接"
+            if let database { sqlite3_close(database) }
+            throw IndexDatabaseError.sqlite(code: code, message: message)
+        }
+        do {
+            let collation = sqlite3_create_collation_v2(database, "FILESIGHT_NAME", SQLITE_UTF8, nil, { _, leftCount, leftBytes, rightCount, rightBytes in
+                guard let leftBytes, let rightBytes else { return leftBytes == nil ? (rightBytes == nil ? 0 : -1) : 1 }
+                let left = UnsafeRawBufferPointer(start: leftBytes, count: Int(leftCount)).bindMemory(to: UInt8.self)
+                let right = UnsafeRawBufferPointer(start: rightBytes, count: Int(rightCount)).bindMemory(to: UInt8.self)
+                switch String(decoding: left, as: UTF8.self).compare(String(decoding: right, as: UTF8.self), options: .numeric) {
+                case .orderedAscending: return -1
+                case .orderedDescending: return 1
+                case .orderedSame: return 0
+                }
+            }, nil)
+            guard collation == SQLITE_OK else {
+                throw IndexDatabaseError.sqlite(code: collation, message: "无法注册读取排序规则")
+            }
+            guard sqlite3_busy_timeout(database, 2000) == SQLITE_OK else {
+                throw IndexDatabaseError.sqlite(code: sqlite3_extended_errcode(database), message: "无法设置读取等待时间")
+            }
+            return database
+        } catch {
+            sqlite3_close(database)
+            throw error
         }
     }
 }

@@ -1,7 +1,7 @@
 import Foundation
 import Darwin
 
-struct DirectoryIdentity: Codable, Equatable {
+package struct DirectoryIdentity: Codable, Equatable {
     let device: Int32
     let inode: UInt64
     init(_ value: stat) { device = value.st_dev; inode = value.st_ino }

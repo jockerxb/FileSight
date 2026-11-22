@@ -98,6 +98,60 @@ try Data("not a sqlite database".utf8).write(to: corruptURL)
 let recovered = try IndexDatabase.openRecovering(url: corruptURL)
 try require(recovered.fileCount == 0, "损坏数据库没有自动恢复")
 
+// Non-corruption failures must never erase their target. The previous recovery
+// policy deleted any path after any open error, including permission and I/O
+// failures.
+let nonDatabaseURL = store.appendingPathComponent("must-stay", isDirectory: true)
+try fm.createDirectory(at: nonDatabaseURL, withIntermediateDirectories: false)
+var rejectedNonDatabase = false
+do { _ = try IndexDatabase.openRecovering(url: nonDatabaseURL) }
+catch { rejectedNonDatabase = true }
+var isDirectory: ObjCBool = false
+try require(rejectedNonDatabase && fm.fileExists(atPath: nonDatabaseURL.path, isDirectory: &isDirectory) && isDirectory.boolValue,
+            "非损坏类错误没有被拒绝，或导致原目录被删除")
+
+// WAL is useful only if reads use a different SQLite connection. Rewrite a
+// large directory while repeatedly searching and prove the foreground query is
+// not waiting for the writer transaction.
+let concurrentURL = store.appendingPathComponent("concurrent.sqlite3")
+let concurrentDatabase = try IndexDatabase(url: concurrentURL)
+let concurrentEntries = (0..<8_000).map {
+    FileEntry(path: "/virtual/并发合同-\($0).pdf", modified: now, created: now, kind: "pdf")
+}
+_ = try concurrentDatabase.replaceDirectory(path: "/virtual", entries: concurrentEntries, children: [:])
+let writerGroup = DispatchGroup()
+let writerStarted = DispatchSemaphore(value: 0)
+final class ErrorBox: @unchecked Sendable {
+    private let lock = NSLock(); private var stored: Error?
+    func set(_ error: Error) { lock.lock(); stored = error; lock.unlock() }
+    var value: Error? { lock.lock(); defer { lock.unlock() }; return stored }
+}
+let writerError = ErrorBox()
+writerGroup.enter()
+DispatchQueue.global(qos: .utility).async {
+    writerStarted.signal()
+    do {
+        let changed = concurrentEntries.map {
+            FileEntry(path: $0.path, modified: now.addingTimeInterval(1), created: now, kind: $0.kind)
+        }
+        _ = try concurrentDatabase.replaceDirectory(path: "/virtual", entries: changed, children: [:])
+    } catch { writerError.set(error) }
+    writerGroup.leave()
+}
+writerStarted.wait()
+var foregroundQueries = 0
+var longestQuery = 0.0
+repeat {
+    let started = ProcessInfo.processInfo.systemUptime
+    let page = try concurrentDatabase.search(parsed: .parse("并发"), order: .relevance, ascending: true, limit: 5)
+    longestQuery = max(longestQuery, ProcessInfo.processInfo.systemUptime - started)
+    try require(page?.rows.count == 5, "并发更新期间搜索丢失结果")
+    foregroundQueries += 1
+} while writerGroup.wait(timeout: .now()) == .timedOut
+if let error = writerError.value { throw error }
+try require(foregroundQueries > 0 && longestQuery < 1,
+            "索引写入阻塞了前台搜索：\(String(format: "%.0f", longestQuery * 1000)) ms")
+
 // A filesystem access warning is not a database consistency failure. Marking
 // the snapshot complete prevents the same inaccessible path from triggering a
 // full traversal on every launch.
@@ -108,7 +162,13 @@ let warningRoot = ScanRoot(url: missingRoot)
 let warningIndex = FileIndex(timeout: 2, database: warningDatabase)
 warningIndex.start(authorizedRoots: [warningRoot], watch: false)
 try wait("不可读目录扫描未结束") { !warningIndex.view().scanning }
+try require(warningIndex.view().errorCount > 0, "首次扫描没有上报访问提示")
 try require(try warningDatabase.prepare(roots: [warningRoot]), "访问提示导致下次启动重复全量扫描")
+warningIndex.stop()
+let restoredWarningIndex = FileIndex(timeout: 2, database: warningDatabase)
+restoredWarningIndex.start(authorizedRoots: [warningRoot], watch: false)
+try require(!restoredWarningIndex.view().scanning && restoredWarningIndex.view().errorCount > 0,
+            "重启后缓存索引丢失了目录访问提示")
 
 // A failed SQLite update must not acknowledge newer filesystem events. The
 // previous checkpoint is intentionally retained so replay can repair the gap.
@@ -117,4 +177,4 @@ try warningDatabase.invalidateCache()
 try require(warningDatabase.checkpoint == 1234, "失效缓存错误推进了 FSEvents checkpoint")
 try require(!(try warningDatabase.prepare(roots: [warningRoot])), "失效缓存没有触发下次启动重建")
 
-print("PASS：SQLite 持久化、健康启动、短词/拼音/首字母、数字排序、完整命中、类型/日期、异步总数、强制重建、损坏恢复、访问提示、checkpoint 一致性与离线事件补齐均通过。")
+print("PASS：SQLite 持久化、健康启动、短词/拼音/首字母、数字排序、完整命中、类型/日期、异步总数、强制重建、仅损坏恢复、访问提示跨重启、checkpoint 一致性与离线事件补齐均通过。")

@@ -53,6 +53,7 @@ public struct FileDateFilter {
 }
 
 public struct ParsedSearchQuery {
+    public let rawText: String
     public let text: String
     public let categories: Set<FileCategory>
     public let date: FileDateFilter?
@@ -60,10 +61,17 @@ public struct ParsedSearchQuery {
     public let withoutDate: String
 
     public var hasFilters: Bool { !categories.isEmpty || date != nil }
-    /// App names are searched independently from file-type filters. Keep type
-    /// words such as "keynote" or "pdf", while removing date expressions that
-    /// cannot be part of an application name.
-    public var applicationText: String { withoutDate }
+    /// App lookup and file filtering are separate interpretations of the same
+    /// input. The literal input preserves apps whose names resemble a date or a
+    /// file type; the date-stripped form supports queries such as
+    /// "最近1个月 keynote" without making the filter part of the app name.
+    public var applicationQueries: [String] {
+        var seen = Set<String>()
+        return [rawText, withoutDate].filter {
+            let normalized = FileEntry.normalize($0.trimmingCharacters(in: .whitespacesAndNewlines))
+            return !normalized.isEmpty && seen.insert(normalized).inserted
+        }
+    }
     public var categoryTitle: String {
         FileCategory.allCases.filter(categories.contains).map(\.title).joined(separator: "、")
     }
@@ -93,7 +101,7 @@ public struct ParsedSearchQuery {
         }
         var dateSet = Set<Int>()
         if let dateIndex { dateSet.insert(dateIndex) }
-        return Self(text: filename.joined(separator: " "), categories: categories, date: dateFilter,
+        return Self(rawText: prepared, text: filename.joined(separator: " "), categories: categories, date: dateFilter,
                     withoutCategories: joining(excluding: categoryIndices), withoutDate: joining(excluding: dateSet))
     }
 
